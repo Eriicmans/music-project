@@ -1,6 +1,6 @@
-import React, { RefObject, useState } from 'react';
-import { Modal, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
-import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import React, { RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { Animated, BackHandler, Easing, PanResponder, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { formatClock } from '../core/player/format';
 import { QueueItem, RepeatMode } from '../core/player/queue';
 import { Cover } from './Cover';
@@ -26,16 +26,52 @@ interface Props {
   onCycleRepeat: () => void;
 }
 
-/** Pantalla completa de reproducción (estilo app de streaming, con nuestra paleta). */
+/**
+ * Pantalla completa de reproducción (estilo app de streaming, con nuestra paleta).
+ * IMPORTANTE: es una capa dentro de la propia app, NO un modal nativo. Un modal a pantalla
+ * completa hace que iOS retire la vista de debajo de la ventana y el reproductor (WebView) se pausa.
+ * Debe renderizarse como hermano del contenido, a nivel raíz, y dentro de un SafeAreaProvider.
+ */
 export function NowPlaying(p: Props) {
+  const { height } = useWindowDimensions();
+  const y = useRef(new Animated.Value(height)).current;
+  const onClose = useRef(p.onClose);
+  onClose.current = p.onClose;
+
+  useEffect(() => {
+    Animated.timing(y, { toValue: 0, duration: 300, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [y]);
+
+  const close = () => {
+    Animated.timing(y, { toValue: height, duration: 240, easing: Easing.in(Easing.cubic), useNativeDriver: true })
+      .start(({ finished }) => { if (finished) onClose.current(); });
+  };
+  const closeRef = useRef(close);
+  closeRef.current = close;
+
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => { closeRef.current(); return true; });
+    return () => sub.remove();
+  }, []);
+
+  /* Arrastrar hacia abajo desde la cabecera cierra la pantalla. */
+  const drag = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) => g.dy > 8 && Math.abs(g.dy) > Math.abs(g.dx),
+    onPanResponderMove: (_, g) => { if (g.dy > 0) y.setValue(g.dy); },
+    onPanResponderRelease: (_, g) => {
+      if (g.dy > 110 || g.vy > 1.2) closeRef.current();
+      else Animated.spring(y, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
+    },
+  }), [y]);
+
   return (
-    <Modal visible animationType="slide" presentationStyle="fullScreen" onRequestClose={p.onClose}>
-      <SafeAreaProvider><Inner {...p} /></SafeAreaProvider>
-    </Modal>
+    <Animated.View style={[s.overlay, { transform: [{ translateY: y }] }]}>
+      <Inner {...p} onClose={close} dragHandlers={drag.panHandlers} />
+    </Animated.View>
   );
 }
 
-function Inner({ item, source, playing, shuffle, repeat, engine, onClose, onToggle, onNext, onPrev, onToggleShuffle, onCycleRepeat }: Props) {
+function Inner({ item, source, playing, shuffle, repeat, engine, onClose, onToggle, onNext, onPrev, onToggleShuffle, onCycleRepeat, dragHandlers }: Props & { dragHandlers: object }) {
   const insets = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
   const { position, duration, set } = usePlayerProgress(engine, playing, item.videoId);
@@ -47,7 +83,7 @@ function Inner({ item, source, playing, shuffle, repeat, engine, onClose, onTogg
 
   return (
     <View style={[s.root, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 16 }]}>
-      <View style={s.top}>
+      <View style={s.top} {...dragHandlers}>
         <IconBtn name="chevron-down" tone="light" onPress={onClose} iconSize={26} />
         <View style={{ flex: 1, alignItems: 'center', gap: 2 }}>
           <Text style={s.kicker}>REPRODUCIENDO DESDE</Text>
@@ -98,6 +134,7 @@ function Icon3({ name, onPress }: { name: 'play-skip-back' | 'play-skip-forward'
 }
 
 const s = StyleSheet.create({
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 100, backgroundColor: colors.dark },
   root: { flex: 1, backgroundColor: colors.dark, paddingHorizontal: 24, justifyContent: 'space-between' },
   top: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   kicker: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },

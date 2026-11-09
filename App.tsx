@@ -59,6 +59,10 @@ export default function App() {
   const [shuffle, setShuffle] = useState(false);
   const [repeat, setRepeat] = useState<RepeatMode>('off');
   const [expanded, setExpanded] = useState(false);
+  const [unlocked, setUnlocked] = useState(false);
+  const [engineLog, setEngineLog] = useState<string[]>([]);
+  const log = useCallback((m: string) => setEngineLog(l => [...l.slice(-11), `${new Date().toLocaleTimeString()} ${m}`]), []);
+  const [awaitingTap, setAwaitingTap] = useState(false);
   const [source, setSource] = useState('Playlist');
   const engine = useRef<PlayerHandle>(null);
   const [manualFor, setManualFor] = useState<Track | null>(null);
@@ -214,6 +218,18 @@ export default function App() {
     step(1);
   };
 
+  /* iOS: la primera reproducción necesita un toque dentro del reproductor (que va invisible sobre el botón de play). Si en 1,5 s no ha empezado solo, se avisa. */
+  const curVideo = nowIdx !== null ? queue[nowIdx]?.videoId : undefined;
+  useEffect(() => {
+    if (!curVideo || !playing || unlocked) return;
+    const t = setTimeout(() => { setAwaitingTap(true); setExpanded(false); }, 1500);
+    return () => clearTimeout(t);
+  }, [curVideo, playing, unlocked]);
+  const onPlayingChange = (p: boolean) => {
+    setPlaying(p);
+    if (p) { setUnlocked(true); setAwaitingTap(false); }
+  };
+
   /* ---------- Datos derivados ---------- */
   const nowVideoId = nowIdx !== null ? queue[nowIdx]?.videoId : undefined;
   const nowTrackId = nowIdx !== null ? queue[nowIdx]?.trackId : undefined;
@@ -299,6 +315,7 @@ export default function App() {
 
       <Btn tone="soft" label="Diagnóstico de YouTube Music" onPress={onDebug} />
       {debugOut && <Text style={s.mono}>{debugOut}</Text>}
+      {engineLog.length > 0 && <Text style={s.mono}>{'Reproductor:\n' + engineLog.join('\n')}</Text>}
     </ScrollView>
   );
 
@@ -365,6 +382,7 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
+      <View style={{ flex: 1 }}>
       <SafeAreaView style={s.safe}>
         {tab === 'review' && db
           ? <ReviewScreen db={db} search={search} onChanged={() => countByStatus(db).then(setCounts)} />
@@ -381,22 +399,17 @@ export default function App() {
 
         {nowIdx !== null && queue[nowIdx] && (
           <>
-            <YouTubePlayer
-              ref={engine} videoId={queue[nowIdx].videoId} playing={playing}
-              onEnded={onEnded} onError={onPlayerError} onPlayingChange={setPlaying}
-            />
             <MiniPlayerWithProgress
-              item={queue[nowIdx]} playing={playing} engine={engine}
-              onOpen={() => setExpanded(true)} onToggle={() => setPlaying(p => !p)} onNext={() => step(1)}
+              item={queue[nowIdx]} playing={playing} engine={engine} awaitingTap={awaitingTap}
+              player={
+                <YouTubePlayer
+                  ref={engine} videoId={queue[nowIdx].videoId} playing={playing} catchTap={!unlocked} onLog={log}
+                  onEnded={onEnded} onError={onPlayerError} onPlayingChange={onPlayingChange}
+                />
+              }
+              onOpen={() => { if (unlocked && !awaitingTap) setExpanded(true); }}
+              onToggle={() => setPlaying(p => !p)} onNext={() => step(1)}
             />
-            {expanded && (
-              <NowPlaying
-                item={queue[nowIdx]} source={source} playing={playing} shuffle={shuffle} repeat={repeat} engine={engine}
-                onClose={() => setExpanded(false)} onToggle={() => setPlaying(p => !p)}
-                onNext={() => step(1)} onPrev={onPrev}
-                onToggleShuffle={toggleShuffle} onCycleRepeat={() => setRepeat(nextRepeat)}
-              />
-            )}
           </>
         )}
 
@@ -416,19 +429,30 @@ export default function App() {
 
         <TabBar tab={tab} onChange={goTab} pending={counts.pending ?? 0} />
       </SafeAreaView>
+
+        {expanded && !awaitingTap && nowIdx !== null && queue[nowIdx] && (
+          <NowPlaying
+            item={queue[nowIdx]} source={source} playing={playing} shuffle={shuffle} repeat={repeat} engine={engine}
+            onClose={() => setExpanded(false)} onToggle={() => setPlaying(p => !p)}
+            onNext={() => step(1)} onPrev={onPrev}
+            onToggleShuffle={toggleShuffle} onCycleRepeat={() => setRepeat(nextRepeat)}
+          />
+        )}
+      </View>
     </SafeAreaProvider>
   );
 }
 
 /** Mini-reproductor con su propio sondeo de progreso (así App no se redibuja cada 0,5 s). */
-function MiniPlayerWithProgress({ item, playing, engine, onOpen, onToggle, onNext }: {
-  item: QueueItem; playing: boolean; engine: React.RefObject<PlayerHandle | null>;
+function MiniPlayerWithProgress({ item, playing, engine, awaitingTap, player, onOpen, onToggle, onNext }: {
+  item: QueueItem; playing: boolean; engine: React.RefObject<PlayerHandle | null>; awaitingTap: boolean; player: React.ReactNode;
   onOpen: () => void; onToggle: () => void; onNext: () => void;
 }) {
   const { position, duration } = usePlayerProgress(engine, playing, item.videoId);
   return (
     <MiniPlayer
       item={item} playing={playing} progress={duration > 0 ? position / duration : 0}
+      awaitingTap={awaitingTap} engine={player}
       onOpen={onOpen} onToggle={onToggle} onNext={onNext}
     />
   );
