@@ -57,13 +57,18 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - Descripciones de YouTube/canales "Topic" aún no se usan como señal.
 
 ## Plan de pasos
-1. ✅ Matching base corregido + tests.
-2. ✅ Parseo de títulos, versiones, feat., similitud.
-3. ✅ Persistencia SQLite.
-4. ✅ Importador de Spotify (vía embed público; ver sección 'Paso 4').
-5. ⏭ Búsqueda de candidatos en YouTube (decidir librería/endpoint no oficial) + scoring + cola de revisión.
-6. Pantalla de revisión de coincidencias (2-3 mejores candidatos por canción dudosa).
-7. Reproductor.
+1–4. ✅ (matching, parseo, SQLite, importador Spotify)
+5a. ✅ Búsqueda YT Music (`src/providers/youtubeMusic/search.ts`; NO verificado contra red real)
+5b. ✅ (lógica) `toCandidate`, `findCandidates`, `runMatching` (cola con pausas). ⏭ Falta enlazar con `repository.recordMatching` y botón en App.tsx (necesita ver repository.ts y App.tsx)
+6. Pantalla de revisión (2-3 mejores candidatos por canción dudosa)
+7. Reproductor
+
+## Pasos 5a/5b — Búsqueda YouTube Music y cola de matching
+- Endpoint interno POST music.youtube.com/youtubei/v1/search (WEB_REMIX, sin cuota). `SONGS_FILTER` de ytmusicapi no verificado: si no devuelve nada, `findCandidates` reintenta con `filter:false` y descarta kind 'other'.
+- `toCandidate(YtResult)` → `TrackCandidate` (version vía parseTitle, durationMs = sec*1000).
+- `findCandidates(track, search)` → `ScoredCandidate[] {candidate,result}` ordenado (auto > review > reject, luego score).
+- `runMatching(tracks, {search, record, shouldSkip, sleep, random}, {delayMs=800 + hasta 50 %, maxConsecutiveErrors=5, onProgress, signal})` → resumen. `record` se adapta a `recordMatching` (formato de `scored` por confirmar con repository.ts).
+- Entrega: el usuario recibe archivos completos con ruta y los sustituye; no pegar fragmentos.
 
 ## Pendiente de preguntar / decidir
 - Método de reproducción en iOS (afecta a segundo plano).
