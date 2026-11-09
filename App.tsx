@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
+import { Alert, FlatList, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
 import { SearchFn } from './src/core/matching/matchTrack';
@@ -10,14 +10,16 @@ import { makeQueueDeps } from './src/db/matchingAdapter';
 import { openDb } from './src/db/openDb';
 import {
   ChosenVideo, countByStatus, deletePlaylist, getChosenVideos, getPlaylistEntries, listPlaylists, PlaylistEntry, PlaylistInfo,
-  removeTrackFromPlaylist, renamePlaylist,
+  getPlaylistCovers, removeTrackFromPlaylist, renamePlaylist,
 } from './src/db/repository';
 import { ImportError } from './src/importers/errors';
 import { importSpotifyPlaylist } from './src/importers/spotify/importPlaylist';
 import { searchYtMusic, YtResult } from './src/providers/youtubeMusic/search';
 import { BackupPanel } from './src/ui/BackupPanel';
-import { PlaylistCard, TrackRow } from './src/ui/cards';
-import { Btn, Chip, Disc, Icon, IconBtn } from './src/ui/kit';
+import { PlaylistCard, PlaylistHero, TrackRow } from './src/ui/cards';
+import { LinearGradient } from 'expo-linear-gradient';
+import { Btn, Chip, Disc, GlassBtn, Icon, IconBtn } from './src/ui/kit';
+import { PlaylistCover } from './src/ui/PlaylistCover';
 import { ManualSearch } from './src/ui/ManualSearch';
 import { SearchScreen } from './src/ui/SearchScreen';
 import { MiniPlayer } from './src/ui/MiniPlayer';
@@ -26,7 +28,7 @@ import { usePlayerProgress } from './src/ui/usePlayerProgress';
 import { PlayerHandle, YouTubePlayer } from './src/ui/YouTubePlayer';
 import { ReviewScreen } from './src/ui/ReviewScreen';
 import { Tab, TabBar } from './src/ui/TabBar';
-import { colors, fonts, radius, type } from './src/ui/theme';
+import { colors, fonts, greeting, radius, tintFor, type } from './src/ui/theme';
 
 const search: SearchFn = (query, opts) => searchYtMusic(query, { filter: opts?.filter });
 
@@ -45,6 +47,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [current, setCurrent] = useState<{ playlistId: string; name: string } | null>(null);
   const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
+  const [covers, setCovers] = useState<Record<string, string[]>>({});
   const [entries, setEntries] = useState<PlaylistEntry[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [chosen, setChosen] = useState<Record<string, ChosenVideo>>({});
@@ -71,9 +74,15 @@ export default function App() {
   const [debugOut, setDebugOut] = useState<string | null>(null);
   const signal = useRef({ aborted: false });
 
+  /** Recarga la lista de playlists y las miniaturas de sus portadas. */
+  const loadLibrary = useCallback(async (d: Db) => {
+    setPlaylists(await listPlaylists(d));
+    setCovers(await getPlaylistCovers(d));
+  }, []);
+
   useEffect(() => {
     openDb()
-      .then(async d => { setDb(d); setCounts(await countByStatus(d)); setPlaylists(await listPlaylists(d)); })
+      .then(async d => { setDb(d); setCounts(await countByStatus(d)); await loadLibrary(d); })
       .catch(e => setError(`Error de base de datos: ${String(e)}`));
   }, []);
 
@@ -86,7 +95,7 @@ export default function App() {
   const goTab = async (t: Tab) => {
     setTab(t);
     if (t === 'library' && db) {
-      setPlaylists(await listPlaylists(db));
+      await loadLibrary(db);
       setCounts(await countByStatus(db));
       if (current) await refresh(db, current.playlistId);
     }
@@ -100,7 +109,7 @@ export default function App() {
       const sum = await importSpotifyPlaylist(db, url);
       setCurrent({ playlistId: sum.playlistId, name: sum.name });
       setTrackFilter('all'); setShowImport(false); setUrl('');
-      setPlaylists(await listPlaylists(db));
+      await loadLibrary(db);
       await refresh(db, sum.playlistId);
       setMessage(
         `${sum.total} canciones importadas (${sum.newTracks} nuevas).` +
@@ -122,7 +131,7 @@ export default function App() {
   };
   const closePlaylist = async () => {
     setCurrent(null); setMessage(null); setError(null);
-    if (db) { setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db)); }
+    if (db) { await loadLibrary(db); setCounts(await countByStatus(db)); }
   };
   const askDelete = (p: PlaylistInfo) =>
     Alert.alert('Borrar playlist', `¿Borrar "${p.name}"? Se perderán también sus coincidencias elegidas.`, [
@@ -132,7 +141,7 @@ export default function App() {
         onPress: async () => {
           if (!db) return;
           await deletePlaylist(db, p.id);
-          setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db));
+          await loadLibrary(db); setCounts(await countByStatus(db));
           if (current?.playlistId === p.id) setCurrent(null);
         },
       },
@@ -148,7 +157,7 @@ export default function App() {
         onPress: async () => {
           await removeTrackFromPlaylist(db, current.playlistId, e.position);
           await refresh(db, current.playlistId);
-          setPlaylists(await listPlaylists(db));
+          await loadLibrary(db);
         },
       },
     ]);
@@ -166,7 +175,7 @@ export default function App() {
           if (!name) return;
           await renamePlaylist(db, current.playlistId, name);
           setCurrent({ playlistId: current.playlistId, name });
-          setPlaylists(await listPlaylists(db));
+          await loadLibrary(db);
         },
       },
     ], 'plain-text', current.name);
@@ -292,30 +301,36 @@ export default function App() {
   );
 
   /* ---------- Vistas ---------- */
+  const totalReady = playlists.reduce((n, p) => n + p.resolved, 0);
+  const hero = !query.trim() && libFilter === 'all' ? visiblePlaylists[0] : undefined;
+  const gridList = hero ? visiblePlaylists.slice(1) : visiblePlaylists;
+
   const library = (
     <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
       <View style={s.topRow}>
-        <IconBtn name="musical-notes" tone="dark" onPress={() => {}} disabled={false} />
-        <Text style={type.small}>{playlists.length} {playlists.length === 1 ? 'playlist' : 'playlists'}</Text>
-      </View>
-      <Text style={type.h1}>Tu música,{'\n'}siempre a mano</Text>
-
-      <View style={s.searchRow}>
-        <View style={s.search}>
-          <Icon name="search" size={18} color={colors.faint} />
-          <TextInput
-            style={s.searchInput} value={query} onChangeText={setQuery}
-            placeholder="Buscar playlist…" placeholderTextColor={colors.faint} autoCorrect={false}
-          />
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text style={type.kicker}>{greeting().toUpperCase()}</Text>
+          <Text style={type.display}>Tu música</Text>
         </View>
-        <IconBtn name={showImport ? 'close' : 'add'} tone="accent" size={48} iconSize={22} onPress={() => setShowImport(v => !v)} />
+        <IconBtn name={showImport ? 'close' : 'add'} tone="accent" size={52} iconSize={24} onPress={() => setShowImport(v => !v)} />
+      </View>
+      <Text style={type.body}>
+        {playlists.length} {playlists.length === 1 ? 'playlist' : 'playlists'} · {totalReady} canciones listas para sonar
+      </Text>
+
+      <View style={s.search}>
+        <Icon name="search" size={18} color={colors.faint} />
+        <TextInput
+          style={s.searchInput} value={query} onChangeText={setQuery}
+          placeholder="Buscar playlist…" placeholderTextColor={colors.faint} autoCorrect={false}
+        />
       </View>
 
       {(showImport || playlists.length === 0) && (
-        <View style={s.banner}>
+        <LinearGradient colors={['#C0562F', '#6E2A14']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={s.banner}>
           <View style={s.bannerTop}>
             <View style={{ flex: 1, gap: 6 }}>
-              <Text style={s.bannerKicker}>Spotify</Text>
+              <Text style={s.bannerKicker}>SPOTIFY</Text>
               <Text style={s.bannerTitle}>Importa una playlist</Text>
               <Text style={s.bannerBody}>Pega el enlace de una playlist pública.</Text>
             </View>
@@ -327,15 +342,11 @@ export default function App() {
             autoCapitalize="none" autoCorrect={false} keyboardType="url"
           />
           <Btn tone="light" label="Importar" onPress={onImport} busy={busy} disabled={!db || matching || !url.trim()} />
-        </View>
+        </LinearGradient>
       )}
 
       {notices}
 
-      <View style={s.sectionHead}>
-        <Text style={type.h2}>Tus playlists</Text>
-        <Text style={type.small}>{visiblePlaylists.length} de {playlists.length}</Text>
-      </View>
       <View style={s.chips}>
         <Chip label="Todas" selected={libFilter === 'all'} onPress={() => setLibFilter('all')} />
         <Chip label="Completas" selected={libFilter === 'complete'} onPress={() => setLibFilter('complete')} />
@@ -343,16 +354,26 @@ export default function App() {
       </View>
 
       {playlists.length > 0 && visiblePlaylists.length === 0 && <Text style={type.body}>Ninguna playlist coincide.</Text>}
+      {hero && <PlaylistHero info={hero} videoIds={covers[hero.id] ?? []} onPress={() => openPlaylist(hero)} />}
+      {gridList.length > 0 && (
+        <View style={s.sectionHead}>
+          <Text style={type.h2}>{hero ? 'Más playlists' : 'Tus playlists'}</Text>
+          <Text style={type.small}>{visiblePlaylists.length} de {playlists.length}</Text>
+        </View>
+      )}
       <View style={s.grid}>
-        {visiblePlaylists.map(p => (
-          <PlaylistCard key={p.id} info={p} width={cardW} onPress={() => openPlaylist(p)} onDelete={() => askDelete(p)} />
+        {gridList.map((p, i) => (
+          <PlaylistCard
+            key={p.id} info={p} videoIds={covers[p.id] ?? []} width={cardW} index={i}
+            onPress={() => openPlaylist(p)} onDelete={() => askDelete(p)}
+          />
         ))}
       </View>
 
       {db && (
         <BackupPanel
           db={db}
-          onRestored={async () => { setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db)); }}
+          onRestored={async () => { await loadLibrary(db); setCounts(await countByStatus(db)); }}
         />
       )}
 
@@ -362,29 +383,34 @@ export default function App() {
     </ScrollView>
   );
 
-  const detail = current && (
-    <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
-      <View style={s.detailBar}>
-        <IconBtn name="chevron-back" onPress={closePlaylist} />
-        <Text style={s.detailBarTitle}>Playlist</Text>
-        <IconBtn name="trash-outline" onPress={() => currentInfo && askDelete(currentInfo)} disabled={!currentInfo} />
-      </View>
-
-      <View style={s.stage}><Disc seed={current.name} size={150} /></View>
-
-      <View style={s.nameRow}>
-        <View style={{ flex: 1, gap: 4 }}>
-          <Pressable onPress={askRename} disabled={Platform.OS !== 'ios'} style={s.nameTap}>
-            <Text style={[s.detailName, { flexShrink: 1 }]} numberOfLines={2}>{current.name}</Text>
-            {Platform.OS === 'ios' && <Icon name="create-outline" size={16} color={colors.faint} />}
-          </Pressable>
-          <Text style={type.small}>{entries.length} canciones · {pending} dudosas · {none} sin resultado</Text>
+  const detailCovers = Array.from(new Set(entries.map(e => e.videoId).filter((v): v is string => !!v))).slice(0, 4);
+  const detailHeader = current && (
+    <View style={s.listHeader}>
+      <LinearGradient colors={tintFor(current.name)} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={s.heroBox}>
+        <View style={s.heroBlob} />
+        <View style={s.detailBar}>
+          <GlassBtn name="chevron-back" onPress={closePlaylist} />
+          <Text style={s.heroKicker}>PLAYLIST</Text>
+          <GlassBtn name="trash-outline" onPress={() => currentInfo && askDelete(currentInfo)} disabled={!currentInfo} />
         </View>
-        <View style={{ alignItems: 'flex-end' }}>
-          <Text style={s.big}>{ready}<Text style={s.bigMuted}>/{entries.length}</Text></Text>
-          <Text style={type.small}>listas</Text>
+
+        <View style={s.heroCover}>
+          <PlaylistCover name={current.name} videoIds={detailCovers} size={176} radius={radius.lg} />
         </View>
-      </View>
+
+        <Pressable onPress={askRename} disabled={Platform.OS !== 'ios'} style={s.nameTap}>
+          <Text style={[s.detailName, { flexShrink: 1 }]} numberOfLines={2}>{current.name}</Text>
+          {Platform.OS === 'ios' && <Icon name="create-outline" size={16} color="rgba(255,255,255,0.7)" />}
+        </Pressable>
+        <Text style={s.heroStats}>
+          {entries.length} canciones · {ready} listas · {pending} dudosas · {none} sin resultado
+        </Text>
+
+        <View style={s.row}>
+          <Btn flex tone="light" icon="play" label="Reproducir" onPress={() => startAt(undefined, false)} disabled={!hasPlayable} />
+          <GlassBtn name="shuffle" size={52} onPress={() => startAt(undefined, true)} disabled={!hasPlayable} />
+        </View>
+      </LinearGradient>
 
       <View style={s.chips}>
         <Chip tone="dark" label="Todas" selected={trackFilter === 'all'} onPress={() => setTrackFilter('all')} />
@@ -411,21 +437,35 @@ export default function App() {
 
       {entries.length > 0 && <Text style={type.small}>Mantén pulsada una canción para quitarla de la playlist.</Text>}
 
-      <View style={{ gap: 8 }}>
-        {visibleEntries.length === 0 && <Text style={type.body}>No hay canciones en este filtro.</Text>}
-        {visibleEntries.map(e => {
-          const v = chosen[e.track.id];
-          return (
-            <TrackRow
-              key={e.position} index={e.position + 1} title={e.track.title} artists={e.track.artists.join(', ')}
-              videoCaption={v ? `↳ ${v.title} — ${v.artists.join(', ')}` : undefined}
-              status={e.status} isNow={e.track.id === nowTrackId} playable={!!v}
-              onPress={() => startAt(e.track.id)} onSearch={() => setManualFor(e.track)} onLongPress={() => askRemove(e)}
-            />
-          );
-        })}
-      </View>
-    </ScrollView>
+    </View>
+  );
+
+  /** FlatList (virtualizada): solo se pintan las filas visibles, importa con listas largas y miniaturas. */
+  const detail = current && (
+    <FlatList
+      data={visibleEntries}
+      extraData={[nowTrackId, chosen]}
+      keyExtractor={e => String(e.position)}
+      contentContainerStyle={s.listContainer}
+      keyboardShouldPersistTaps="handled"
+      initialNumToRender={12}
+      windowSize={9}
+      ListHeaderComponent={detailHeader ?? undefined}
+      ListEmptyComponent={<Text style={type.body}>No hay canciones en este filtro.</Text>}
+      ItemSeparatorComponent={RowGap}
+      renderItem={({ item: e }: { item: PlaylistEntry }) => {
+        const v = chosen[e.track.id];
+        return (
+          <TrackRow
+            index={e.position + 1} title={e.track.title} artists={e.track.artists.join(', ')}
+            videoId={e.videoId ?? undefined}
+            videoCaption={v ? `↳ ${v.title} — ${v.artists.join(', ')}` : undefined}
+            status={e.status} isNow={e.track.id === nowTrackId} playable={!!v}
+            onPress={() => startAt(e.track.id)} onSearch={() => setManualFor(e.track)} onLongPress={() => askRemove(e)}
+          />
+        );
+      }}
+    />
   );
 
   return (
@@ -437,13 +477,6 @@ export default function App() {
           : tab === 'search' && db
             ? <SearchScreen db={db} search={search} nowVideoId={nowVideoId} onPlay={playSearchResult} />
             : (current ? detail : library)}
-
-        {tab === 'library' && current && hasPlayable && (
-          <View style={s.actionBar}>
-            <Btn flex label="Reproducir" icon="play" onPress={() => startAt(undefined, false)} />
-            <IconBtn name="shuffle" tone="dark" size={52} onPress={() => startAt(undefined, true)} />
-          </View>
-        )}
 
         {nowIdx !== null && queue[nowIdx] && (
           <>
@@ -470,7 +503,7 @@ export default function App() {
               setManualFor(null);
               setMessage(`"${manualFor.title}" ahora usa: ${v.title} — ${v.artists.join(', ')}.`);
               await refresh(db, current.playlistId);
-              setPlaylists(await listPlaylists(db));
+              await loadLibrary(db);
             }}
           />
         )}
@@ -491,6 +524,8 @@ export default function App() {
   );
 }
 
+const RowGap = () => <View style={{ height: 8 }} />;
+
 /** Mini-reproductor con su propio sondeo de progreso (así App no se redibuja cada 0,5 s). */
 function MiniPlayerWithProgress({ item, playing, engine, awaitingTap, player, onOpen, onToggle, onNext }: {
   item: QueueItem; playing: boolean; engine: React.RefObject<PlayerHandle | null>; awaitingTap: boolean; player: React.ReactNode;
@@ -509,23 +544,22 @@ function MiniPlayerWithProgress({ item, playing, engine, awaitingTap, player, on
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
   container: { padding: 24, paddingBottom: 28, gap: 16 },
-  topRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  topRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
   row: { flexDirection: 'row', gap: 10 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   /* buscador */
-  searchRow: { flexDirection: 'row', gap: 10 },
   search: {
-    flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, paddingHorizontal: 14,
+    flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, paddingHorizontal: 14,
     backgroundColor: colors.chip, borderRadius: radius.md,
   },
   searchInput: { flex: 1, color: colors.text, fontSize: 15 },
   /* banner de importación */
-  banner: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 20, gap: 14 },
+  banner: { borderRadius: radius.xl, padding: 20, gap: 14, overflow: 'hidden' },
   bannerTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  bannerKicker: { color: colors.gold, fontSize: 12, fontWeight: '800', letterSpacing: 0.5 },
-  bannerTitle: { color: colors.onDark, fontSize: 22, lineHeight: 26, fontWeight: '800', letterSpacing: -0.5 },
+  bannerKicker: { color: '#FFE2B8', fontSize: 11, fontWeight: '800', letterSpacing: 1.6 },
+  bannerTitle: { color: colors.onDark, fontSize: 24, lineHeight: 28, fontWeight: '900', letterSpacing: -0.6 },
   bannerBody: { color: colors.onDarkMuted, fontSize: 13 },
-  bannerField: { backgroundColor: colors.onDarkLine, color: colors.onDark, borderRadius: radius.sm, paddingHorizontal: 14, paddingVertical: 13, fontSize: 14 },
+  bannerField: { backgroundColor: 'rgba(0,0,0,0.22)', color: colors.onDark, borderRadius: radius.sm, paddingHorizontal: 14, paddingVertical: 13, fontSize: 14 },
   /* avisos */
   notice: { backgroundColor: colors.chip, borderRadius: radius.md, padding: 14 },
   noticeText: { color: colors.text, fontSize: 13, lineHeight: 19 },
@@ -533,17 +567,21 @@ const s = StyleSheet.create({
   sectionHead: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
   grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
   mono: { color: colors.muted, fontSize: 11, fontFamily: fonts.mono },
-  /* detalle */
+  /* cabecera de playlist */
+  listContainer: { padding: 24, paddingBottom: 28 },
+  listHeader: { gap: 16, marginBottom: 16 },
+  heroBox: { borderRadius: radius.xl, padding: 16, gap: 14, alignItems: 'stretch', overflow: 'hidden' },
+  heroBlob: { position: 'absolute', width: 280, height: 280, borderRadius: 140, right: -90, top: -110, backgroundColor: 'rgba(255,255,255,0.12)' },
   detailBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  detailBarTitle: { color: colors.text, fontSize: 16, fontWeight: '700' },
-  stage: { backgroundColor: colors.chip, borderRadius: radius.xl, height: 210, alignItems: 'center', justifyContent: 'center' },
-  nameRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
-  nameTap: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  detailName: { color: colors.text, fontSize: 24, lineHeight: 28, fontWeight: '800', letterSpacing: -0.6 },
-  big: { color: colors.text, fontSize: 26, fontWeight: '800', letterSpacing: -0.6 },
-  bigMuted: { color: colors.faint, fontSize: 16, fontWeight: '700' },
+  heroKicker: { color: 'rgba(255,255,255,0.85)', fontSize: 11, fontWeight: '800', letterSpacing: 2 },
+  heroCover: {
+    alignSelf: 'center', borderRadius: radius.lg,
+    shadowColor: '#000', shadowOpacity: 0.4, shadowRadius: 20, shadowOffset: { width: 0, height: 12 }, elevation: 12,
+  },
+  nameTap: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
+  detailName: { color: '#FFFFFF', fontSize: 28, lineHeight: 32, fontWeight: '900', letterSpacing: -0.8, textAlign: 'center' },
+  heroStats: { color: 'rgba(255,255,255,0.8)', fontSize: 12, textAlign: 'center' },
   panel: { gap: 10, backgroundColor: colors.card, borderRadius: radius.lg, padding: 16, borderWidth: 1, borderColor: colors.line },
   bar: { height: 6, borderRadius: 3, backgroundColor: colors.chip, overflow: 'hidden' },
   barFill: { height: 6, backgroundColor: colors.accent },
-  actionBar: { flexDirection: 'row', gap: 10, paddingHorizontal: 24, paddingTop: 10 },
 });

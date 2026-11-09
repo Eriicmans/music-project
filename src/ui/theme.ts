@@ -36,4 +36,10 @@ const h2: TextStyle = { color: colors.text, fontSize: 18, fontWeight: '800', let
 const body: TextStyle = { color: colors.muted, fontSize: 14, lineHeight: 20 };
 const small: TextStyle = { color: colors.muted, fontSize: 12, lineHeight: 17 };
 
-export const type = { h1, h2, body, small };
+const display: TextStyle = { color: colors.text, fontSize: 40, lineHeight: 44, fontWeight: '900', letterSpacing: -1.4 };
+const kicker: TextStyle = { color: colors.accent, fontSize: 11, fontWeight: '800', letterSpacing: 1.6 };
+
+export const type = { h1, h2, body, small, display, kicker };
+
+export { tints, tintFor, greeting } from './palette';
+export type { Tint } from './palette';

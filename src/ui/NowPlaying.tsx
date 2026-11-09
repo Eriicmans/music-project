@@ -1,12 +1,13 @@
 import React, { RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, BackHandler, Easing, PanResponder, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { formatClock } from '../core/player/format';
 import { QueueItem, RepeatMode } from '../core/player/queue';
 import { Cover } from './Cover';
 import { Icon, IconBtn } from './kit';
 import { Slider } from './Slider';
-import { colors, radius } from './theme';
+import { colors, radius, tintFor } from './theme';
 import { usePlayerProgress } from './usePlayerProgress';
 import { PlayerHandle } from './YouTubePlayer';
 
@@ -80,9 +81,13 @@ function Inner({ item, source, playing, shuffle, repeat, engine, onClose, onTogg
   const cover = Math.min(width - 56, height * 0.4);
   const fraction = duration > 0 ? position / duration : 0;
   const shown = scrub !== null ? scrub * duration : position;
+  const [, deep] = tintFor(item.videoId); // el fondo cambia de color con cada canción
 
   return (
-    <View style={[s.root, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 16 }]}>
+    <LinearGradient
+      colors={[deep, colors.dark]} start={{ x: 0.2, y: 0 }} end={{ x: 0.8, y: 0.75 }}
+      style={[s.root, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 16 }]}
+    >
       <View style={s.top} {...dragHandlers}>
         <IconBtn name="chevron-down" tone="light" onPress={onClose} iconSize={26} />
         <View style={{ flex: 1, alignItems: 'center', gap: 2 }}>
@@ -124,7 +129,7 @@ function Inner({ item, source, playing, shuffle, repeat, engine, onClose, onTogg
           {repeat === 'one' && <View style={s.one}><Text style={s.oneText}>1</Text></View>}
         </View>
       </View>
-    </View>
+    </LinearGradient>
   );
 }
 

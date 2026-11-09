@@ -34,6 +34,21 @@ export function IconBtn({ name, onPress, tone = 'soft', size = 46, iconSize = 20
   );
 }
 
+/* ---------- Botón redondo translúcido (sobre degradados) ---------- */
+export function GlassBtn({ name, onPress, size = 42, disabled }: { name: IconName; onPress: () => void; size?: number; disabled?: boolean }) {
+  return (
+    <Pressable
+      onPress={onPress} disabled={disabled} hitSlop={6}
+      style={({ pressed }) => ({
+        width: size, height: size, borderRadius: size / 2, backgroundColor: 'rgba(255,255,255,0.22)',
+        alignItems: 'center', justifyContent: 'center', opacity: disabled ? 0.35 : pressed ? 0.7 : 1,
+      })}
+    >
+      <Icon name={name} size={Math.round(size * 0.48)} color="#FFFFFF" />
+    </Pressable>
+  );
+}
+
 /* ---------- Botón con texto ---------- */
 type BtnTone = 'accent' | 'dark' | 'soft' | 'light';
 const BTN_BG: Record<BtnTone, string> = { accent: colors.accent, dark: colors.dark, soft: colors.chip, light: colors.onDark };

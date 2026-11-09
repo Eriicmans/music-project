@@ -7,18 +7,19 @@ export type Tab = 'library' | 'search' | 'review';
 
 /** Barra flotante en forma de píldora marrón. */
 export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab) => void; pending: number }) {
-  const item = (t: Tab, icon: IconName, badge?: number) => (
+  const item = (t: Tab, icon: IconName, label: string, badge?: number) => (
     <Pressable onPress={() => onChange(t)} style={[s.item, tab === t && s.itemOn]}>
       <Icon name={icon} size={22} color={tab === t ? colors.onDark : colors.onDarkMuted} />
+      {tab === t && <Text style={s.label}>{label}</Text>}
       {badge ? <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View> : null}
     </Pressable>
   );
   return (
     <View style={s.wrap}>
       <View style={s.pill}>
-        {item('library', tab === 'library' ? 'albums' : 'albums-outline')}
-        {item('search', tab === 'search' ? 'search' : 'search-outline')}
-        {item('review', tab === 'review' ? 'checkmark-done' : 'checkmark-done-outline', pending)}
+        {item('library', tab === 'library' ? 'albums' : 'albums-outline', 'Biblioteca')}
+        {item('search', tab === 'search' ? 'search' : 'search-outline', 'Buscar')}
+        {item('review', tab === 'review' ? 'checkmark-done' : 'checkmark-done-outline', 'Revisar', pending)}
       </View>
     </View>
   );
@@ -27,10 +28,11 @@ export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab
 const s = StyleSheet.create({
   wrap: { alignItems: 'center', paddingVertical: 8, backgroundColor: colors.bg },
   pill: { flexDirection: 'row', gap: 6, padding: 6, borderRadius: radius.xl, backgroundColor: colors.dark },
-  item: { width: 62, height: 46, borderRadius: radius.lg, alignItems: 'center', justifyContent: 'center' },
-  itemOn: { backgroundColor: 'rgba(244,239,230,0.16)' },
+  item: { minWidth: 56, height: 46, paddingHorizontal: 14, borderRadius: radius.lg, flexDirection: 'row', gap: 8, alignItems: 'center', justifyContent: 'center' },
+  itemOn: { backgroundColor: colors.accent },
+  label: { color: colors.onDark, fontSize: 13, fontWeight: '800' },
   badge: {
-    position: 'absolute', top: 2, right: 10, minWidth: 17, height: 17, borderRadius: 9, paddingHorizontal: 4,
+    position: 'absolute', top: 0, right: 4, minWidth: 17, height: 17, borderRadius: 9, paddingHorizontal: 4,
     backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
   },
   badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },

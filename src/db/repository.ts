@@ -306,6 +306,24 @@ export async function listPlaylists(db: Db): Promise<PlaylistInfo[]> {
 }
 
 /**
+ * Vídeos (hasta `max`, sin repetir) de las primeras canciones ya resueltas de cada playlist,
+ * en orden: sirven para componer su portada. Indexado por id de playlist.
+ */
+export async function getPlaylistCovers(db: Db, max = 4): Promise<Record<string, string[]>> {
+  const rows = await db.getAllAsync<{ playlist_id: string; video_id: string }>(
+    `SELECT pt.playlist_id, m.video_id
+     FROM playlist_tracks pt
+     JOIN matches m ON m.track_id = pt.track_id AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL
+     ORDER BY pt.playlist_id, pt.position`);
+  const out: Record<string, string[]> = {};
+  for (const r of rows) {
+    const list = (out[r.playlist_id] ??= []);
+    if (list.length < max && !list.includes(r.video_id)) list.push(r.video_id);
+  }
+  return out;
+}
+
+/**
  * Borra una playlist y las canciones que ya no están en ninguna otra
  * (con sus coincidencias y candidatos). Las canciones compartidas se conservan.
  */

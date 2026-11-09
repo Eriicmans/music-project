@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 13 (mejoras de biblioteca y copia de seguridad)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 14 (rediseño con portadas y más personalidad)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -140,6 +140,16 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - Borrado `src/ui/PlayerDock.tsx` (sin uso).
 - Tests nuevos: `tests/library.test.ts`.
 - **Pendiente de verificar en el iPhone:** pulsación larga, renombrar, Exportar (hoja de compartir) y Restaurar pegando el texto.
+
+## Paso 14 — Rediseño con portadas y personalidad (hecho; 94 tests OK en sandbox; UI NO ejecutada en dispositivo)
+- **Dependencia nueva:** `npx expo install expo-linear-gradient` (degradados).
+- **Portadas de playlist:** `getPlaylistCovers(db, max=4)` en `repository.ts` (vídeos distintos de las primeras canciones resueltas). `src/ui/PlaylistCover.tsx`: mosaico 2×2 con miniaturas de YouTube (≥4), una sola (1–3) o degradado con inicial (sin ninguna). En App, `covers` se recarga junto a `playlists` con `loadLibrary(db)`; la cabecera de la playlist calcula su mosaico desde `entries`.
+- **Color por playlist/canción:** `src/ui/palette.ts` (parte pura, testeable: `tints` sin verdes, `tintFor(seed)`, `greeting()`), reexportado desde `theme.ts`; `type.display` y `type.kicker` nuevos. Tests en `tests/covers.test.ts`.
+- **Inicio:** saludo según la hora + "Tu música" a lo grande, resumen de canciones listas, `PlaylistHero` (última añadida, degradado de su color) y cuadrícula de `PlaylistCard` (portada a sangre, nombre sobre degradado, barra de avance, aviso de dudosas, borrar). Banner de importación con degradado.
+- **Playlist:** cabecera de degradado con portada grande, nombre (tocar = renombrar en iOS), estadísticas y botones Reproducir / aleatorio (`GlassBtn`); se quitó la barra inferior fija. `TrackRow` muestra la miniatura del vídeo elegido (o el número) y resalta la que suena.
+- **Reproductor y barra:** `NowPlaying` con fondo degradado que cambia de color con cada canción (`tintFor(videoId)`); `TabBar` muestra la etiqueta de la pestaña activa con fondo óxido. `src/ui/motion.tsx`: `PressScale` (encoge al tocar) y `FadeIn` (aparición escalonada).
+- **Listas largas:** la lista de canciones de la playlist es un `FlatList` (virtualizado, `extraData=[nowTrackId, chosen]`) con la cabecera como `ListHeaderComponent`. Se descartó `@shopify/flash-list`: dependencia nativa extra, solo compensa con miles de filas; Búsqueda (≤20), búsqueda manual (≤15) y revisión (3) siguen con `ScrollView` porque son cortas.
+- **Pendiente conocido:** la pausa en iOS sigue sin detener el audio (el intento de reintento en `YouTubePlayer.tsx` no lo arregló; mirar el panel "Reproductor:" de la Biblioteca). Posible mejora: portada personalizada elegida por el usuario (`expo-image-picker`).
 
 ## Siguiente sesión (orden recomendado)
 - **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).
