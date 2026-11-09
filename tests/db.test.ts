@@ -4,7 +4,7 @@ import { migrate, SCHEMA_VERSION } from '../src/db/migrations';
 import {
   getCachedVideoId, getMatchStatus, getPlaylistEntries, getTrack, listPendingReviews,
   recordMatching, resolveManual, savePlaylist, upsertTrack, countByStatus, ScoredCandidate,
-  getChosenVideos, markNone,
+  getChosenVideos, markNone, listPlaylists, deletePlaylist,
 } from '../src/db/repository';
 import { scoreCandidate } from '../src/core/matching/scoreCandidate';
 import { Track, TrackCandidate } from '../src/models/Track';
@@ -114,5 +114,28 @@ describe('revisión manual', () => {
     await markNone(db, 'a');
     expect(await listPendingReviews(db)).toHaveLength(0);
     expect(await getMatchStatus(db, 'a')).toEqual({ status: 'none', videoId: null });
+  });
+});
+
+describe('biblioteca', () => {
+  it('lista playlists con total, resueltas y pendientes', async () => {
+    const a = track('a'); const b = track('b', { title: 'Otra' });
+    await upsertTrack(db, a); await upsertTrack(db, b);
+    await savePlaylist(db, { name: 'L', spotifyId: 'pl1' }, ['a', 'b']);
+    await recordMatching(db, 'a', [score(a, cand('v1'))]);
+    await recordMatching(db, 'b', [score(b, cand('v2', { title: 'Otra', durationMs: undefined }))]);
+    expect(await listPlaylists(db)).toMatchObject([{ name: 'L', total: 2, resolved: 1, pending: 1 }]);
+  });
+  it('borrar elimina las canciones huérfanas pero conserva las compartidas', async () => {
+    const a = track('a'); const b = track('b', { title: 'Otra' });
+    await upsertTrack(db, a); await upsertTrack(db, b);
+    const p1 = await savePlaylist(db, { name: 'L1', spotifyId: 'pl1' }, ['a', 'b']);
+    await savePlaylist(db, { name: 'L2', spotifyId: 'pl2' }, ['a']);
+    await recordMatching(db, 'b', [score(b, cand('v2', { title: 'Otra' }))]);
+    await deletePlaylist(db, p1);
+    expect(await getTrack(db, 'a')).not.toBeNull();
+    expect(await getTrack(db, 'b')).toBeNull();
+    expect(await getMatchStatus(db, 'b')).toBeNull();
+    expect((await listPlaylists(db)).map(p => p.name)).toEqual(['L2']);
   });
 });

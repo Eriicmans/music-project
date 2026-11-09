@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
 import { SearchFn } from './src/core/matching/matchTrack';
 import { Db } from './src/db/database';
 import { makeQueueDeps } from './src/db/matchingAdapter';
 import { openDb } from './src/db/openDb';
-import { ChosenVideo, countByStatus, getChosenVideos, getPlaylistEntries, PlaylistEntry } from './src/db/repository';
+import {
+  ChosenVideo, countByStatus, deletePlaylist, getChosenVideos, getPlaylistEntries, listPlaylists, PlaylistEntry, PlaylistInfo,
+} from './src/db/repository';
 import { ImportError } from './src/importers/errors';
-import { importSpotifyPlaylist, ImportSummary } from './src/importers/spotify/importPlaylist';
+import { importSpotifyPlaylist } from './src/importers/spotify/importPlaylist';
 import { searchYtMusic } from './src/providers/youtubeMusic/search';
 import { buildQueue, QueueItem, stepIndex } from './src/core/player/queue';
 import { ReviewScreen } from './src/ui/ReviewScreen';
@@ -24,7 +26,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [summary, setSummary] = useState<ImportSummary | null>(null);
+  const [current, setCurrent] = useState<{ playlistId: string; name: string } | null>(null);
+  const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
   const [entries, setEntries] = useState<PlaylistEntry[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [matching, setMatching] = useState(false);
@@ -38,7 +41,7 @@ export default function App() {
   const signal = useRef({ aborted: false });
 
   useEffect(() => {
-    openDb().then(async d => { setDb(d); setCounts(await countByStatus(d)); }).catch(e => setError(`Error de base de datos: ${String(e)}`));
+    openDb().then(async d => { setDb(d); setCounts(await countByStatus(d)); setPlaylists(await listPlaylists(d)); }).catch(e => setError(`Error de base de datos: ${String(e)}`));
   }, []);
 
   const refresh = useCallback(async (d: Db, playlistId: string) => {
@@ -52,7 +55,8 @@ export default function App() {
     setBusy(true); setError(null); setMessage(null);
     try {
       const s = await importSpotifyPlaylist(db, url);
-      setSummary(s);
+      setCurrent({ playlistId: s.playlistId, name: s.name });
+      setPlaylists(await listPlaylists(db));
       await refresh(db, s.playlistId);
       setMessage(
         `${s.total} canciones importadas (${s.newTracks} nuevas).` +
@@ -67,7 +71,7 @@ export default function App() {
   };
 
   const onMatch = async () => {
-    if (!db || !summary || matching) return;
+    if (!db || !current || matching) return;
     setMatching(true); setError(null); setMessage(null);
     signal.current = { aborted: false };
     try {
@@ -79,7 +83,7 @@ export default function App() {
           onProgress: p => setProgress({ done: p.done, total: p.total, title: p.track.title }),
         },
       );
-      await refresh(db, summary.playlistId);
+      await refresh(db, current.playlistId);
       const parts = [
         `${s.auto} automáticas`, `${s.review} a revisar`, `${s.none} sin resultado`,
         s.skipped ? `${s.skipped} ya resueltas` : '', s.errors ? `${s.errors} errores` : '',
@@ -111,6 +115,29 @@ export default function App() {
     }
   };
 
+  const openPlaylist = async (p: PlaylistInfo) => {
+    if (!db) return;
+    setCurrent({ playlistId: p.id, name: p.name }); setMessage(null); setError(null);
+    await refresh(db, p.id);
+  };
+  const closePlaylist = async () => {
+    setCurrent(null);
+    if (db) { setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db)); }
+  };
+  const askDelete = (p: PlaylistInfo) =>
+    Alert.alert('Borrar playlist', `¿Borrar "${p.name}"? Se perderán también sus coincidencias elegidas.`, [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Borrar', style: 'destructive',
+        onPress: async () => {
+          if (!db) return;
+          await deletePlaylist(db, p.id);
+          setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db));
+          if (current?.playlistId === p.id) setCurrent(null);
+        },
+      },
+    ]);
+
   const startAt = (trackId?: string) => {
     const q = buildQueue(entries);
     if (q.length === 0) return;
@@ -133,7 +160,7 @@ export default function App() {
     return (
       <SafeAreaProvider>
         <SafeAreaView style={styles.safe}>
-          <ReviewScreen db={db} onClose={() => { setScreen('home'); refresh(db, summary?.playlistId ?? ''); }} />
+          <ReviewScreen db={db} onClose={() => { setScreen('home'); if (current) refresh(db, current.playlistId); else countByStatus(db).then(setCounts); }} />
         </SafeAreaView>
       </SafeAreaProvider>
     );
@@ -143,7 +170,7 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView style={styles.safe}>
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-          <Text style={styles.eyebrow}>PROYECTO PRIVADO · V0.7</Text>
+          <Text style={styles.eyebrow}>PROYECTO PRIVADO · V0.8</Text>
           <Text style={styles.title}>Importar playlist</Text>
           <View style={styles.card}>
             <Text style={styles.body}>Pega el enlace de una playlist pública de Spotify.</Text>
@@ -159,9 +186,31 @@ export default function App() {
             {error && <Text style={styles.err}>{error}</Text>}
           </View>
 
-          {summary && (
+          {!current && (
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>{summary.name}</Text>
+              <Text style={styles.cardTitle}>Tus playlists</Text>
+              {playlists.length === 0 && <Text style={styles.body}>Aún no hay ninguna. Importa una arriba.</Text>}
+              {(counts.pending ?? 0) > 0 && (
+                <Pressable style={styles.button} onPress={() => setScreen('review')}>
+                  <Text style={styles.buttonText}>Revisar dudosas ({counts.pending})</Text>
+                </Pressable>
+              )}
+              {playlists.map(p => (
+                <View key={p.id} style={styles.listRow}>
+                  <Pressable style={styles.listMain} onPress={() => openPlaylist(p)}>
+                    <Text style={styles.listTitle} numberOfLines={1}>{p.name}</Text>
+                    <Text style={styles.sub0}>{p.total} canciones · ✅ {p.resolved} · ❓ {p.pending}</Text>
+                  </Pressable>
+                  <Pressable style={styles.ctl} onPress={() => askDelete(p)}><Text style={styles.ctlText}>🗑</Text></Pressable>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {current && (
+            <View style={styles.card}>
+              <Pressable onPress={closePlaylist}><Text style={styles.back}>← Playlists</Text></Pressable>
+              <Text style={styles.cardTitle}>{current.name}</Text>
               {!matching ? (
                 <Pressable style={[styles.button, busy && styles.buttonOff]} onPress={onMatch} disabled={busy}>
                   <Text style={styles.buttonText}>Buscar coincidencias</Text>
@@ -251,6 +300,11 @@ const styles = StyleSheet.create({
   controls: { flexDirection: 'row', justifyContent: 'space-around' },
   ctl: { padding: 10 },
   ctlText: { color: '#FFFFFF', fontSize: 24 },
+  back: { color: '#70D6A4', fontSize: 15, fontWeight: '700' },
+  listRow: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#0B0D12', borderRadius: 12, paddingLeft: 12 },
+  listMain: { flex: 1, paddingVertical: 10, gap: 2 },
+  listTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
+  sub0: { color: '#8D9AAF', fontSize: 12 },
   sub: { color: '#70D6A4', fontSize: 12, paddingLeft: 22 },
   mono: { color: '#B6C0D0', fontSize: 11, fontFamily: 'Courier' },
   input: { backgroundColor: '#0B0D12', color: '#FFFFFF', borderRadius: 12, padding: 12, fontSize: 14 },

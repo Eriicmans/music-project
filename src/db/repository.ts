@@ -209,3 +209,34 @@ export async function getChosenVideos(db: Db, playlistId: string): Promise<Recor
 export async function markNone(db: Db, trackId: string): Promise<void> {
   await setMatch(db, trackId, 'none', null, null);
 }
+
+export interface PlaylistInfo { id: string; name: string; total: number; resolved: number; pending: number }
+
+/** Playlists guardadas, las más recientes primero, con su progreso de matching. */
+export async function listPlaylists(db: Db): Promise<PlaylistInfo[]> {
+  return db.getAllAsync<PlaylistInfo>(
+    `SELECT p.id AS id, p.name AS name,
+            COUNT(pt.track_id) AS total,
+            COALESCE(SUM(CASE WHEN m.status IN ('auto','manual') THEN 1 ELSE 0 END), 0) AS resolved,
+            COALESCE(SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending
+     FROM playlists p
+     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+     LEFT JOIN matches m ON m.track_id = pt.track_id
+     GROUP BY p.id ORDER BY p.created_at DESC, p.name`);
+}
+
+/**
+ * Borra una playlist y las canciones que ya no están en ninguna otra
+ * (con sus coincidencias y candidatos). Las canciones compartidas se conservan.
+ */
+export async function deletePlaylist(db: Db, playlistId: string): Promise<void> {
+  await db.execAsync('BEGIN');
+  try {
+    await db.runAsync('DELETE FROM playlists WHERE id = ?', [playlistId]);
+    await db.execAsync('DELETE FROM tracks WHERE id NOT IN (SELECT track_id FROM playlist_tracks)');
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}

@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 7** (reproductor v1). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 8** (biblioteca de playlists, verificada). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -63,6 +63,7 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 5c. ✅ Enlace BD + botón en App.tsx
 6. ✅ Pantalla de revisión
 7. ✅ Reproductor v1 (iframe oficial; sin segundo plano)
+8. ✅ Biblioteca de playlists
 
 ## Pasos 5a/5b — Búsqueda YouTube Music y cola de matching
 - Endpoint interno POST music.youtube.com/youtubei/v1/search (WEB_REMIX, sin cuota). `SONGS_FILTER` de ytmusicapi no verificado: si no devuelve nada, `findCandidates` reintenta con `filter:false` y descarta kind 'other'.
@@ -82,14 +83,24 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - `App.tsx` V0.6: cada fila muestra "↳ vídeo elegido"; botón "Revisar dudosas (N)" si hay pendientes; contadores cargados al abrir la BD.
 - La playlist de prueba del usuario salió toda ✅, así que la pantalla de revisión aún no se ha visto con datos reales.
 
-## Paso 7 — Reproductor v1 (hecho; NO ejecutado en este entorno)
+## Paso 7 — Reproductor v1 (hecho; el usuario confirmó que todo funciona en su iPhone)
 - Dependencias nuevas: `npx expo install react-native-webview` y `npm i react-native-youtube-iframe`.
 - `src/core/player/queue.ts` (`buildQueue`, `stepIndex`; `tests/queue.test.ts`, 2 tests), `src/ui/YouTubePlayer.tsx` (único acoplado a react-native-youtube-iframe; props videoId/playing/onEnded/onError/onPlayingChange), `App.tsx` V0.7: "▶ Reproducir playlist", tocar una canción con vídeo la reproduce, barra con ⏮ ⏯ ⏭ ✕, siguiente automático al terminar, salta si el vídeo no es embebible.
 - Limitaciones: se pausa con la pantalla bloqueada/app en segundo plano (WebView); el reproductor se detiene al entrar en la pantalla de revisión. Fase siguiente posible: segundo plano (dev build + modo audio, o motor no oficial reescribiendo solo YouTubePlayer).
 
-## Siguiente sesión
-- Si YT Music falla: ajustar `search.ts` según la salida del botón de prueba.
-- Paso 7: reproductor.
+## Estado verificado (9-nov-2026)
+- El usuario confirmó que funcionan: importación de Spotify, búsqueda en YT Music, matching (su playlist de prueba salió toda ✅), pantalla de revisión (sin datos dudosos para probarla aún) y reproductor.
+- **GitHub:** el repo github.com/Eriicmans/music-project ya está reconectado y tiene TODO el código subido hasta el paso 7 (se cierra el pendiente de "reconectar con GitHub"). Se trabaja con el repo/repomix que sube el usuario.
+- **Datos:** las playlists y coincidencias viven en la SQLite local de la app (`music.db`) en el iPhone, no en el PC ni en GitHub. Se pierden si se desinstala la app.
+
+## Paso 8 — Biblioteca de playlists (hecho; NO ejecutado en este entorno)
+- `repository.ts`: `listPlaylists` (total/resueltas/pendientes) y `deletePlaylist` (borra la playlist y las canciones huérfanas con sus coincidencias; conserva las compartidas). 2 tests nuevos en `tests/db.test.ts`.
+- `App.tsx` V0.8: la home muestra "Tus playlists" (tocar abre, 🗑 borra con confirmación); dentro, "← Playlists" vuelve. El estado `summary` se sustituyó por `current`. "Revisar dudosas" aparece en la lista y en la playlist abierta.
+
+## Siguiente sesión (orden recomendado)
+- **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).
+- Verificado por el usuario: paso 8 (biblioteca) funciona.
+- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) búsqueda manual para corregir una canción mal asignada o sin resultado (✖️); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
 - Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project`.
 
 ## Pendiente de preguntar / decidir
