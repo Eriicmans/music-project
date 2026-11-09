@@ -50,12 +50,16 @@ assets/
 src/
   core/
     matching/
+      manualSearch.ts
       matchQueue.ts
       matchTrack.ts
       parseTitle.ts
       scoreCandidate.ts
     player/
+      format.ts
       queue.ts
+    search/
+      searchSongs.ts
   db/
     database.ts
     matchingAdapter.ts
@@ -75,27 +79,38 @@ src/
       search.ts
       toCandidate.ts
   ui/
+    AddToPlaylistSheet.tsx
     cards.tsx
+    Cover.tsx
     kit.tsx
+    ManualSearch.tsx
+    MiniPlayer.tsx
+    NowPlaying.tsx
     PlayerDock.tsx
     ReviewScreen.tsx
+    SearchScreen.tsx
+    Slider.tsx
     TabBar.tsx
     theme.ts
+    usePlayerProgress.ts
     YouTubePlayer.tsx
 tests/
   helpers/
     nodeSqliteDb.ts
   db.test.ts
+  manualSearch.test.ts
   matching-cases.md
   matchQueue.test.ts
   queue.test.ts
   scoreCandidate.test.ts
+  search.test.ts
   spotify.test.ts
   youtubeMusic.test.ts
 .gitignore
 AGENTS.md
 app.json
 App.tsx
+ARCHITECTURE.md
 CONTEXT.md
 eas.json
 index.ts
@@ -107,6 +122,57 @@ tsconfig.json
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/core/matching/manualSearch.ts">
+import { Track, TrackCandidate } from '../../models/Track';
+import { MatchResult, scoreCandidate } from './scoreCandidate';
+import { SearchFn } from './matchTrack';
+import { YtResult, buildQuery } from '../../providers/youtubeMusic/search';
+import { toCandidate } from '../../providers/youtubeMusic/toCandidate';
+
+export interface ManualResult {
+  candidate: TrackCandidate;
+  result: MatchResult;
+  kind: YtResult['kind'];
+}
+
+/** Texto inicial de la búsqueda manual: "artista título". */
+export const defaultManualQuery = (track: Track): string => buildQuery(track.title, track.artists);
+
+const MAX_RESULTS = 15;
+
+/**
+ * Búsqueda libre en YouTube Music para elegir a mano el vídeo de una canción.
+ * Une "Canciones" y la búsqueda sin filtro (que trae directos, vídeos, etc.),
+ * sin duplicados, y puntúa cada resultado contra la canción original solo
+ * como orientación: aquí decide el usuario, así que no se descarta ninguno.
+ * Si una de las dos búsquedas falla se usa la otra; si fallan ambas, lanza el error.
+ */
+export async function searchManual(track: Track, query: string, search: SearchFn): Promise<ManualResult[]> {
+  const q = query.trim();
+  if (!q) return [];
+
+  const [songs, any] = await Promise.allSettled([search(q), search(q, { filter: false })]);
+  if (songs.status === 'rejected' && any.status === 'rejected') throw songs.reason;
+
+  const all: YtResult[] = [
+    ...(songs.status === 'fulfilled' ? songs.value : []),
+    ...(any.status === 'fulfilled' ? any.value : []),
+  ];
+
+  const seen = new Set<string>();
+  const out: ManualResult[] = [];
+  for (const r of all) {
+    if (r.kind === 'other' || seen.has(r.videoId)) continue;
+    seen.add(r.videoId);
+    const candidate = toCandidate(r);
+    out.push({ candidate, result: scoreCandidate(track, candidate), kind: r.kind });
+  }
+  return out
+    .sort((a, b) => b.result.score - a.result.score || Number(b.kind === 'song') - Number(a.kind === 'song'))
+    .slice(0, MAX_RESULTS);
+}
+</file>
 
 <file path="src/core/matching/matchQueue.ts">
 import { Track } from '../../models/Track';
@@ -472,6 +538,48 @@ export function scoreCandidate(track: Track, candidate: TrackCandidate): MatchRe
 }
 </file>
 
+<file path="src/core/player/format.ts">
+/** 83.4 → "1:23". Valores no válidos o negativos → "0:00". */
+export function formatClock(sec: number): string {
+  const s = Number.isFinite(sec) && sec > 0 ? Math.floor(sec) : 0;
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** Miniatura de YouTube (4:3). En canciones trae la portada cuadrada centrada: basta recortar al centro. */
+export const thumbnailUrl = (videoId: string): string => `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+
+export const clamp01 = (n: number): number => (Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0);
+</file>
+
+<file path="src/core/search/searchSongs.ts">
+import { SearchFn } from '../matching/matchTrack';
+import { YtResult } from '../../providers/youtubeMusic/search';
+
+const MAX_RESULTS = 20;
+
+/**
+ * Búsqueda de canciones para la pestaña Buscar. Usa el filtro "Canciones" de
+ * YouTube Music; si no devuelve nada (el filtro puede haber cambiado) reintenta
+ * sin filtro y descarta lo que no sea canción ni vídeo. Sin duplicados.
+ */
+export async function searchSongs(query: string, search: SearchFn): Promise<YtResult[]> {
+  const q = query.trim();
+  if (!q) return [];
+  let results = await search(q);
+  if (results.length === 0) {
+    results = (await search(q, { filter: false })).filter((r) => r.kind !== 'other');
+  }
+  const seen = new Set<string>();
+  const out: YtResult[] = [];
+  for (const r of results) {
+    if (r.kind === 'other' || seen.has(r.videoId)) continue;
+    seen.add(r.videoId);
+    out.push(r);
+  }
+  return out.slice(0, MAX_RESULTS);
+}
+</file>
+
 <file path="src/db/database.ts">
 /**
  * Interfaz mínima de base de datos. Coincide con un subconjunto de
@@ -510,84 +618,6 @@ export function makeQueueDeps(db: Db, search: SearchFn): QueueDeps {
       return m?.status === 'auto' || m?.status === 'manual' || m?.status === 'pending';
     },
   };
-}
-</file>
-
-<file path="src/db/migrations.ts">
-import { Db } from './database';
-
-/** Cada elemento es una versión del esquema; se aplican en orden. */
-const MIGRATIONS: string[][] = [
-  [
-    `CREATE TABLE tracks (
-      id TEXT PRIMARY KEY,
-      spotify_id TEXT UNIQUE,
-      title TEXT NOT NULL,
-      artists TEXT NOT NULL,
-      album TEXT,
-      duration_ms INTEGER,
-      isrc TEXT,
-      version TEXT NOT NULL,
-      musicbrainz_id TEXT,
-      created_at INTEGER NOT NULL
-    )`,
-    `CREATE TABLE playlists (
-      id TEXT PRIMARY KEY,
-      spotify_id TEXT UNIQUE,
-      name TEXT NOT NULL,
-      source_url TEXT,
-      created_at INTEGER NOT NULL
-    )`,
-    `CREATE TABLE playlist_tracks (
-      playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-      position INTEGER NOT NULL,
-      track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-      PRIMARY KEY (playlist_id, position)
-    )`,
-    `CREATE TABLE candidates (
-      track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-      provider TEXT NOT NULL,
-      external_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      artists TEXT NOT NULL,
-      duration_ms INTEGER,
-      version TEXT NOT NULL,
-      score REAL NOT NULL,
-      decision TEXT NOT NULL,
-      reasons TEXT NOT NULL,
-      conflicts TEXT NOT NULL,
-      warnings TEXT NOT NULL,
-      PRIMARY KEY (track_id, provider, external_id)
-    )`,
-    `CREATE TABLE matches (
-      track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
-      video_id TEXT,
-      status TEXT NOT NULL CHECK (status IN ('auto','manual','pending','none')),
-      score REAL,
-      updated_at INTEGER NOT NULL
-    )`,
-    `CREATE INDEX idx_matches_status ON matches(status)`,
-    `CREATE INDEX idx_playlist_tracks_track ON playlist_tracks(track_id)`,
-  ],
-];
-
-export const SCHEMA_VERSION = MIGRATIONS.length;
-
-export async function migrate(db: Db): Promise<number> {
-  const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
-  let version = row?.user_version ?? 0;
-  for (; version < MIGRATIONS.length; version++) {
-    await db.execAsync('BEGIN');
-    try {
-      for (const statement of MIGRATIONS[version]) await db.execAsync(statement);
-      await db.execAsync(`PRAGMA user_version = ${version + 1}`);
-      await db.execAsync('COMMIT');
-    } catch (error) {
-      await db.execAsync('ROLLBACK');
-      throw error;
-    }
-  }
-  return version;
 }
 </file>
 
@@ -1015,198 +1045,308 @@ export function toCandidate(r: YtResult): TrackCandidate {
 }
 </file>
 
-<file path="src/ui/cards.tsx">
-import React from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { PlaylistInfo } from '../db/repository';
-import { Disc, Icon, StatusDot } from './kit';
-import { colors, radius } from './theme';
+<file path="src/ui/AddToPlaylistSheet.tsx">
+import React, { useEffect, useState } from 'react';
+import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Db } from '../db/database';
+import { addYoutubeTrackToPlaylist, createPlaylist, listPlaylists, PlaylistInfo, YoutubeTrackInput } from '../db/repository';
+import { Btn, Disc, Icon, IconBtn } from './kit';
+import { colors, radius, type } from './theme';
 
-/** Tarjeta de playlist: zona clara con el disco y franja marrón con el nombre. */
-export function PlaylistCard({ info, width, onPress, onDelete }: {
-  info: PlaylistInfo; width: number; onPress: () => void; onDelete: () => void;
-}) {
-  const meta = info.pending > 0 ? `${info.pending} dudosas` : `${info.total} canciones`;
-  return (
-    <Pressable onPress={onPress} style={[s.card, { width }]}>
-      <View style={[s.top, { height: width * 0.78 }]}>
-        <Disc seed={info.name} size={width * 0.54} />
-      </View>
-      <View style={s.bottom}>
-        <View style={{ flex: 1, gap: 2 }}>
-          <Text style={s.meta} numberOfLines={1}>{meta}</Text>
-          <Text style={s.name} numberOfLines={1}>{info.name}</Text>
-        </View>
-        <Pressable onPress={onDelete} hitSlop={8} style={s.round}>
-          <Icon name="trash-outline" size={15} color={colors.dark} />
-        </Pressable>
-      </View>
-    </Pressable>
-  );
+interface Props {
+  db: Db;
+  track: YoutubeTrackInput;
+  onClose: () => void;
+  /** `added` es false si la canción ya estaba en esa playlist. */
+  onDone: (playlistName: string, added: boolean) => void;
 }
 
-/** Fila de canción con el vídeo elegido debajo. */
-export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress }: {
-  index: number; title: string; artists: string; videoCaption?: string; status: string | null;
-  isNow: boolean; playable: boolean; onPress: () => void;
-}) {
+/** Hoja para elegir a qué playlist añadir una canción (o crear una nueva). */
+export function AddToPlaylistSheet({ db, track, onClose, onDone }: Props) {
+  const [playlists, setPlaylists] = useState<PlaylistInfo[] | null>(null);
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => { listPlaylists(db).then(setPlaylists).catch(e => setError(String(e))); }, [db]);
+
+  const add = async (playlistId: string, playlistName: string) => {
+    if (busy) return;
+    setBusy(true); setError(null);
+    try {
+      const r = await addYoutubeTrackToPlaylist(db, playlistId, track);
+      onDone(playlistName, r.added);
+    } catch (e) {
+      setError(`No se pudo añadir: ${String(e)}`);
+      setBusy(false);
+    }
+  };
+
+  const addToNew = async () => {
+    if (busy || !name.trim()) return;
+    setBusy(true); setError(null);
+    try {
+      const id = await createPlaylist(db, name);
+      const r = await addYoutubeTrackToPlaylist(db, id, track);
+      onDone(name.trim(), r.added);
+    } catch (e) {
+      setError(`No se pudo crear la playlist: ${String(e)}`);
+      setBusy(false);
+    }
+  };
+
   return (
-    <Pressable onPress={onPress} disabled={!playable} style={s.row}>
-      <View style={[s.num, isNow && { backgroundColor: colors.accent }]}>
-        {isNow
-          ? <Icon name="musical-notes" size={16} color={colors.onAccent} />
-          : <Text style={s.numText}>{String(index).padStart(2, '0')}</Text>}
+    <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+      <View style={s.root}>
+        <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
+          <View style={s.head}>
+            <View style={{ flex: 1 }}>
+              <Text style={type.small}>Añadir a playlist</Text>
+              <Text style={type.h2} numberOfLines={2}>{track.title}</Text>
+              <Text style={type.small} numberOfLines={1}>{track.artists.join(', ')}</Text>
+            </View>
+            <IconBtn name="close" onPress={onClose} />
+          </View>
+
+          <View style={s.newBox}>
+            <Text style={s.newLabel}>NUEVA PLAYLIST</Text>
+            <View style={s.newRow}>
+              <TextInput
+                style={s.input} value={name} onChangeText={setName} placeholder="Nombre…"
+                placeholderTextColor={colors.onDarkMuted} returnKeyType="done" onSubmitEditing={addToNew}
+              />
+              <Btn tone="light" label="Crear" onPress={addToNew} disabled={busy || !name.trim()} />
+            </View>
+          </View>
+
+          {error && <View style={s.errorBox}><Text style={s.errorText}>{error}</Text></View>}
+          {playlists === null && <ActivityIndicator color={colors.accent} />}
+          {playlists && playlists.length === 0 && (
+            <Text style={type.body}>Aún no tienes playlists. Crea la primera arriba.</Text>
+          )}
+
+          {playlists?.map(p => (
+            <Pressable key={p.id} disabled={busy} onPress={() => add(p.id, p.name)} style={({ pressed }) => [s.item, pressed && { opacity: 0.8 }]}>
+              <Disc seed={p.name} size={44} />
+              <View style={{ flex: 1 }}>
+                <Text style={s.itemName} numberOfLines={1}>{p.name}</Text>
+                <Text style={type.small}>{p.total} canciones</Text>
+              </View>
+              <Icon name="add-circle" size={26} color={colors.accent} />
+            </Pressable>
+          ))}
+        </ScrollView>
       </View>
-      <View style={{ flex: 1, gap: 1 }}>
-        <Text style={[s.title, isNow && { color: colors.accent }]} numberOfLines={1}>{title}</Text>
-        <Text style={s.artist} numberOfLines={1}>{artists}</Text>
-        {videoCaption ? <Text style={s.caption} numberOfLines={1}>{videoCaption}</Text> : null}
-      </View>
-      <StatusDot status={status} />
-    </Pressable>
+    </Modal>
   );
 }
 
 const s = StyleSheet.create({
-  card: { borderRadius: radius.lg, overflow: 'hidden', backgroundColor: colors.chip },
-  top: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.chip },
-  bottom: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.dark, padding: 12, borderRadius: radius.lg },
-  meta: { color: colors.onDarkMuted, fontSize: 11 },
-  name: { color: colors.onDark, fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
-  round: { width: 30, height: 30, borderRadius: 15, backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center' },
-  row: {
-    flexDirection: 'row', alignItems: 'center', gap: 12, padding: 10, paddingRight: 16,
+  root: { flex: 1, backgroundColor: colors.bg },
+  container: { padding: 24, gap: 12, paddingBottom: 40 },
+  head: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, marginBottom: 6 },
+  newBox: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 16, gap: 10 },
+  newLabel: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  newRow: { flexDirection: 'row', gap: 10, alignItems: 'center' },
+  input: { flex: 1, backgroundColor: colors.onDarkLine, color: colors.onDark, borderRadius: radius.sm, paddingHorizontal: 14, paddingVertical: 13, fontSize: 15 },
+  errorBox: { backgroundColor: colors.dangerBg, borderRadius: radius.md, padding: 14 },
+  errorText: { color: colors.danger, fontSize: 13, lineHeight: 19 },
+  item: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12,
     backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line,
   },
-  num: { width: 40, height: 40, borderRadius: radius.sm, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
-  numText: { color: colors.muted, fontSize: 13, fontWeight: '700' },
-  title: { color: colors.text, fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
-  artist: { color: colors.muted, fontSize: 13 },
-  caption: { color: colors.faint, fontSize: 11, fontStyle: 'italic' },
+  itemName: { color: colors.text, fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
 });
 </file>
 
-<file path="src/ui/kit.tsx">
-import React from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
-import { colors, radius } from './theme';
+<file path="src/ui/Cover.tsx">
+import React, { useEffect, useState } from 'react';
+import { Image, View } from 'react-native';
+import { thumbnailUrl } from '../core/player/format';
+import { Disc } from './kit';
+import { colors } from './theme';
 
-/* ---------- Iconos (Ionicons) ---------- */
-export type IconName = React.ComponentProps<typeof Ionicons>['name'];
-
-export function Icon({ name, size = 20, color = colors.text }: { name: IconName; size?: number; color?: string }) {
-  return <Ionicons name={name} size={size} color={color} />;
-}
-
-/* ---------- Botón cuadrado redondeado con icono ---------- */
-type IconTone = 'soft' | 'accent' | 'dark' | 'ghost';
-const ICON_BG: Record<IconTone, string> = { soft: colors.chip, accent: colors.accent, dark: colors.dark, ghost: 'transparent' };
-const ICON_FG: Record<IconTone, string> = { soft: colors.text, accent: colors.onAccent, dark: colors.onDark, ghost: colors.text };
-
-export function IconBtn({ name, onPress, tone = 'soft', size = 46, iconSize = 20, badge, disabled }: {
-  name: IconName; onPress: () => void; tone?: IconTone; size?: number; iconSize?: number; badge?: number; disabled?: boolean;
-}) {
-  return (
-    <Pressable
-      onPress={onPress} disabled={disabled} hitSlop={6}
-      style={({ pressed }) => ({
-        width: size, height: size, borderRadius: radius.md, backgroundColor: ICON_BG[tone],
-        alignItems: 'center', justifyContent: 'center', opacity: disabled ? 0.35 : pressed ? 0.8 : 1,
-      })}
-    >
-      <Icon name={name} size={iconSize} color={ICON_FG[tone]} />
-      {badge ? (
-        <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View>
-      ) : null}
-    </Pressable>
-  );
-}
-
-/* ---------- Botón con texto ---------- */
-type BtnTone = 'accent' | 'dark' | 'soft' | 'light';
-const BTN_BG: Record<BtnTone, string> = { accent: colors.accent, dark: colors.dark, soft: colors.chip, light: colors.onDark };
-const BTN_FG: Record<BtnTone, string> = { accent: colors.onAccent, dark: colors.onDark, soft: colors.text, light: colors.dark };
-
-export function Btn({ label, onPress, tone = 'accent', disabled, busy, flex, icon }: {
-  label: string; onPress: () => void; tone?: BtnTone; disabled?: boolean; busy?: boolean; flex?: boolean; icon?: IconName;
-}) {
-  return (
-    <Pressable
-      onPress={onPress} disabled={disabled || busy}
-      style={({ pressed }) => [
-        s.btn, { backgroundColor: BTN_BG[tone] }, flex && { flex: 1 },
-        (disabled || pressed) && { opacity: disabled ? 0.4 : 0.85 },
-      ]}
-    >
-      {busy ? <ActivityIndicator color={BTN_FG[tone]} /> : (
-        <View style={s.btnInner}>
-          {icon && <Icon name={icon} size={17} color={BTN_FG[tone]} />}
-          <Text style={[s.btnText, { color: BTN_FG[tone] }]}>{label}</Text>
-        </View>
-      )}
-    </Pressable>
-  );
-}
-
-/* ---------- Chip de filtro ---------- */
-export function Chip({ label, selected, onPress, tone = 'accent' }: {
-  label: string; selected: boolean; onPress: () => void; tone?: 'accent' | 'dark';
-}) {
-  const on = tone === 'dark' ? colors.dark : colors.accent;
-  return (
-    <Pressable onPress={onPress} style={[s.chip, { backgroundColor: selected ? on : colors.chip }]}>
-      <Text style={[s.chipText, { color: selected ? colors.onAccent : colors.text }]}>{label}</Text>
-    </Pressable>
-  );
-}
-
-/* ---------- Disco (portada sin imagen) ---------- */
-const TINTS = ['#6B3F22', '#8A5A33', '#9A5A3A', '#5A3A28', '#7C4A2D', '#946B45'];
-const hash = (v: string) => { let h = 0; for (let i = 0; i < v.length; i++) h = (h * 31 + v.charCodeAt(i)) | 0; return Math.abs(h); };
-
-export function Disc({ seed, size = 56 }: { seed: string; size?: number }) {
-  const ring = (f: number, o: number) => ({
-    position: 'absolute' as const, width: size * f, height: size * f, borderRadius: (size * f) / 2,
-    borderWidth: 1, borderColor: `rgba(244,239,230,${o})`,
-  });
-  return (
-    <View style={{
-      width: size, height: size, borderRadius: size / 2, backgroundColor: TINTS[hash(seed) % TINTS.length],
-      alignItems: 'center', justifyContent: 'center',
-    }}>
-      <View style={ring(0.86, 0.16)} />
-      <View style={ring(0.66, 0.12)} />
-      <View style={ring(0.46, 0.1)} />
-      <View style={{ width: size * 0.28, height: size * 0.28, borderRadius: size * 0.14, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }}>
-        <View style={{ width: size * 0.07, height: size * 0.07, borderRadius: size * 0.035, backgroundColor: colors.dark }} />
+/** Portada cuadrada a partir de la miniatura de YouTube; si falla, un disco. */
+export function Cover({ videoId, size, radius = 12, seed }: { videoId: string; size: number; radius?: number; seed: string }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [videoId]);
+  if (failed) {
+    return (
+      <View style={{ width: size, height: size, borderRadius: radius, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' }}>
+        <Disc seed={seed} size={size * 0.78} />
       </View>
-    </View>
+    );
+  }
+  return (
+    <Image
+      source={{ uri: thumbnailUrl(videoId) }} resizeMode="cover" onError={() => setFailed(true)}
+      style={{ width: size, height: size, borderRadius: radius, backgroundColor: colors.chip }}
+    />
   );
 }
+</file>
 
-/* ---------- Estado de coincidencia ---------- */
-export function StatusDot({ status }: { status: string | null }) {
-  const filled = status === 'auto' ? colors.dark : status === 'manual' ? colors.gold : status === 'pending' ? colors.terracotta : null;
+<file path="src/ui/ManualSearch.tsx">
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
+} from 'react-native';
+import { defaultManualQuery, ManualResult, searchManual } from '../core/matching/manualSearch';
+import { SearchFn } from '../core/matching/matchTrack';
+import { Db } from '../db/database';
+import { resolveManualFromSearch } from '../db/repository';
+import { Track } from '../models/Track';
+import { Btn, Icon, IconBtn } from './kit';
+import { colors, radius, type } from './theme';
+
+const fmt = (ms?: number): string => {
+  if (!ms) return '—';
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+interface Props {
+  db: Db;
+  track: Track;
+  /** Vídeo asignado ahora mismo a la canción (se marca como "Elegida"). */
+  currentVideoId?: string | null;
+  search: SearchFn;
+  onClose: () => void;
+  /** Se llama tras guardar la elección; el padre refresca sus datos. */
+  onPicked: (video: { title: string; artists: string[] }) => void;
+}
+
+/** Búsqueda manual en YouTube Music para elegir el vídeo exacto de una canción. */
+export function ManualSearch({ db, track, currentVideoId, search, onClose, onPicked }: Props) {
+  const [q, setQ] = useState(() => defaultManualQuery(track));
+  const [results, setResults] = useState<ManualResult[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reqId = useRef(0);
+
+  const run = useCallback(async (text: string) => {
+    const id = ++reqId.current;
+    setLoading(true); setError(null);
+    try {
+      const r = await searchManual(track, text, search);
+      if (id === reqId.current) setResults(r);
+    } catch (e) {
+      if (id === reqId.current) { setResults(null); setError(`No se pudo buscar: ${(e as Error).message}`); }
+    } finally {
+      if (id === reqId.current) setLoading(false);
+    }
+  }, [track, search]);
+
+  useEffect(() => { run(defaultManualQuery(track)); }, [run, track]);
+
+  const pick = async (m: ManualResult) => {
+    if (saving) return;
+    setSaving(true); setError(null);
+    try {
+      await resolveManualFromSearch(db, track.id, m.candidate, m.result);
+      onPicked({ title: m.candidate.title, artists: m.candidate.artists });
+    } catch (e) {
+      setError(`No se pudo guardar: ${String(e)}`);
+      setSaving(false);
+    }
+  };
+
   return (
-    <View style={{
-      width: 9, height: 9, borderRadius: 5, backgroundColor: filled ?? 'transparent',
-      borderWidth: filled ? 0 : 1.5, borderColor: colors.faint,
-    }} />
+    <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+      <View style={s.root}>
+        <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
+          <View style={s.head}>
+            <View style={{ flex: 1 }}>
+              <Text style={type.small}>Búsqueda manual</Text>
+              <Text style={type.h2}>Elegir vídeo</Text>
+            </View>
+            <IconBtn name="close" onPress={onClose} />
+          </View>
+
+          <View style={s.original}>
+            <Text style={s.originalLabel}>EN SPOTIFY</Text>
+            <Text style={s.originalTitle} numberOfLines={2}>{track.title}</Text>
+            <Text style={s.originalMeta}>
+              {track.artists.join(', ')} · {fmt(track.durationMs)}
+              {track.version !== 'studio' ? ` · ${track.version}` : ''}
+            </Text>
+          </View>
+
+          <View style={s.searchRow}>
+            <View style={s.search}>
+              <Icon name="search" size={18} color={colors.faint} />
+              <TextInput
+                style={s.input} value={q} onChangeText={setQ} placeholder="Artista y título…"
+                placeholderTextColor={colors.faint} autoCorrect={false} returnKeyType="search"
+                onSubmitEditing={() => run(q)} selectTextOnFocus
+              />
+            </View>
+            <IconBtn name="arrow-forward" tone="accent" size={48} onPress={() => run(q)} disabled={loading || !q.trim()} />
+          </View>
+
+          {error && <View style={s.errorBox}><Text style={s.errorText}>{error}</Text></View>}
+          {loading && <ActivityIndicator color={colors.accent} />}
+          {!loading && results && results.length === 0 && (
+            <Text style={type.body}>Sin resultados. Prueba con menos palabras o solo el título.</Text>
+          )}
+
+          {!loading && results?.map(m => {
+            const c = m.candidate;
+            const notes = [...m.result.conflicts, ...m.result.warnings];
+            const isCurrent = c.externalId === currentVideoId;
+            return (
+              <View key={c.externalId} style={[s.card, isCurrent && s.cardCurrent]}>
+                <View style={s.cardHead}>
+                  <Text style={s.kind}>{m.kind === 'song' ? 'CANCIÓN' : 'VÍDEO'}{isCurrent ? ' · ELEGIDA' : ''}</Text>
+                  <Text style={s.score}>{Math.round(m.result.score)} pts</Text>
+                </View>
+                <Text style={s.cardTitle}>{c.title}</Text>
+                <Text style={type.body}>
+                  {c.artists.join(', ') || 'Artista desconocido'}
+                  {c.album ? ` · ${c.album}` : ''} · {fmt(c.durationMs)}
+                </Text>
+                {m.result.reasons.length > 0 && <Text style={s.good}>{m.result.reasons.join(' · ')}</Text>}
+                {notes.length > 0 && <Text style={s.warn}>{notes.join(' · ')}</Text>}
+                <View style={s.row}>
+                  <Btn flex label={isCurrent ? 'Ya elegida' : 'Elegir'} disabled={saving || isCurrent} onPress={() => pick(m)} />
+                  <Btn flex tone="soft" icon="play" label="Escuchar"
+                    onPress={() => Linking.openURL(`https://music.youtube.com/watch?v=${c.externalId}`)} />
+                </View>
+              </View>
+            );
+          })}
+        </ScrollView>
+      </View>
+    </Modal>
   );
 }
 
 const s = StyleSheet.create({
-  badge: {
-    position: 'absolute', top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 4,
-    backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
+  root: { flex: 1, backgroundColor: colors.bg },
+  container: { padding: 24, gap: 14, paddingBottom: 40 },
+  head: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  original: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 18, gap: 4 },
+  originalLabel: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  originalTitle: { color: colors.onDark, fontSize: 22, lineHeight: 27, fontWeight: '800', letterSpacing: -0.5 },
+  originalMeta: { color: colors.onDarkMuted, fontSize: 14 },
+  searchRow: { flexDirection: 'row', gap: 10 },
+  search: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, paddingHorizontal: 14,
+    backgroundColor: colors.chip, borderRadius: radius.md,
   },
-  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
-  btn: { borderRadius: radius.md, paddingVertical: 15, paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
-  btnInner: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  btnText: { fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
-  chip: { borderRadius: radius.sm, paddingVertical: 10, paddingHorizontal: 16 },
-  chipText: { fontSize: 13, fontWeight: '700' },
+  input: { flex: 1, color: colors.text, fontSize: 15 },
+  errorBox: { backgroundColor: colors.dangerBg, borderRadius: radius.md, padding: 14 },
+  errorText: { color: colors.danger, fontSize: 13, lineHeight: 19 },
+  card: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 16, gap: 6, borderWidth: 1, borderColor: colors.line },
+  cardCurrent: { borderColor: colors.gold, borderWidth: 2 },
+  cardHead: { flexDirection: 'row', justifyContent: 'space-between' },
+  kind: { color: colors.faint, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  score: { color: colors.gold, fontSize: 12, fontWeight: '800' },
+  cardTitle: { color: colors.text, fontSize: 17, fontWeight: '800', letterSpacing: -0.3 },
+  good: { color: colors.gold, fontSize: 12 },
+  warn: { color: colors.terracotta, fontSize: 12 },
+  row: { flexDirection: 'row', gap: 10, marginTop: 6 },
 });
 </file>
 
@@ -1276,43 +1416,205 @@ const s = StyleSheet.create({
 });
 </file>
 
-<file path="src/ui/TabBar.tsx">
-import React from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { Icon, IconName } from './kit';
-import { colors, radius } from './theme';
+<file path="src/ui/SearchScreen.tsx">
+import React, { useRef, useState } from 'react';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { parseTitle } from '../core/matching/parseTitle';
+import { SearchFn } from '../core/matching/matchTrack';
+import { searchSongs } from '../core/search/searchSongs';
+import { Db } from '../db/database';
+import { YoutubeTrackInput } from '../db/repository';
+import { YtResult } from '../providers/youtubeMusic/search';
+import { AddToPlaylistSheet } from './AddToPlaylistSheet';
+import { Disc, Icon, IconBtn } from './kit';
+import { colors, radius, type } from './theme';
 
-export type Tab = 'library' | 'review';
+const fmt = (sec?: number): string => {
+  if (sec === undefined) return '';
+  return `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, '0')}`;
+};
 
-/** Barra flotante en forma de píldora marrón. */
-export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab) => void; pending: number }) {
-  const item = (t: Tab, icon: IconName, badge?: number) => (
-    <Pressable onPress={() => onChange(t)} style={[s.item, tab === t && s.itemOn]}>
-      <Icon name={icon} size={22} color={tab === t ? colors.onDark : colors.onDarkMuted} />
-      {badge ? <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View> : null}
-    </Pressable>
-  );
+const toInput = (r: YtResult): YoutubeTrackInput => ({
+  videoId: r.videoId, title: r.title, artists: r.artists, album: r.album,
+  durationMs: r.durationSec !== undefined ? r.durationSec * 1000 : undefined,
+  version: parseTitle(r.title, r.artists).version,
+});
+
+interface Props {
+  db: Db;
+  search: SearchFn;
+  /** Videoid que suena ahora (se resalta). */
+  nowVideoId?: string;
+  onPlay: (r: YtResult) => void;
+}
+
+/** Pestaña Buscar: busca canciones en YouTube Music, las reproduce y las añade a una playlist. */
+export function SearchScreen({ db, search, nowVideoId, onPlay }: Props) {
+  const [q, setQ] = useState('');
+  const [results, setResults] = useState<YtResult[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [adding, setAdding] = useState<YtResult | null>(null);
+  const reqId = useRef(0);
+
+  const run = async () => {
+    const text = q.trim();
+    if (!text) return;
+    const id = ++reqId.current;
+    setLoading(true); setError(null); setNotice(null);
+    try {
+      const r = await searchSongs(text, search);
+      if (id === reqId.current) setResults(r);
+    } catch (e) {
+      if (id === reqId.current) { setResults(null); setError(`No se pudo buscar: ${(e as Error).message}`); }
+    } finally {
+      if (id === reqId.current) setLoading(false);
+    }
+  };
+
+  const clear = () => { reqId.current++; setQ(''); setResults(null); setError(null); setLoading(false); };
+
   return (
-    <View style={s.wrap}>
-      <View style={s.pill}>
-        {item('library', tab === 'library' ? 'albums' : 'albums-outline')}
-        {item('review', tab === 'review' ? 'checkmark-done' : 'checkmark-done-outline', pending)}
+    <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
+      <Text style={type.small}>YouTube Music</Text>
+      <Text style={type.h1}>Buscar</Text>
+
+      <View style={s.searchRow}>
+        <View style={s.search}>
+          <Icon name="search" size={18} color={colors.faint} />
+          <TextInput
+            style={s.input} value={q} onChangeText={setQ} placeholder="Canciones, artistas…"
+            placeholderTextColor={colors.faint} autoCorrect={false} returnKeyType="search"
+            onSubmitEditing={run}
+          />
+          {q.length > 0 && (
+            <Pressable onPress={clear} hitSlop={10}><Icon name="close-circle" size={18} color={colors.faint} /></Pressable>
+          )}
+        </View>
+        <IconBtn name="arrow-forward" tone="accent" size={48} onPress={run} disabled={loading || !q.trim()} />
       </View>
-    </View>
+
+      {notice && <View style={s.notice}><Text style={s.noticeText}>{notice}</Text></View>}
+      {error && <View style={[s.notice, { backgroundColor: colors.dangerBg }]}><Text style={[s.noticeText, { color: colors.danger }]}>{error}</Text></View>}
+      {loading && <ActivityIndicator color={colors.accent} />}
+      {!loading && results === null && !error && (
+        <Text style={type.body}>Escribe lo que quieras escuchar. Toca un resultado para reproducirlo o el + para añadirlo a una playlist.</Text>
+      )}
+      {!loading && results && results.length === 0 && <Text style={type.body}>Sin resultados. Prueba con otras palabras.</Text>}
+
+      {!loading && results?.map(r => {
+        const isNow = r.videoId === nowVideoId;
+        const meta = [r.artists.join(', ') || 'Artista desconocido', r.album, fmt(r.durationSec)].filter(Boolean).join(' · ');
+        return (
+          <Pressable key={r.videoId} onPress={() => onPlay(r)} style={s.row}>
+            <View style={[s.cover, isNow && { backgroundColor: colors.accent }]}>
+              {isNow ? <Icon name="musical-notes" size={20} color={colors.onAccent} /> : <Disc seed={r.title + r.artists.join()} size={40} />}
+            </View>
+            <View style={{ flex: 1, gap: 1 }}>
+              <Text style={[s.title, isNow && { color: colors.accent }]} numberOfLines={1}>{r.title}</Text>
+              <Text style={s.meta} numberOfLines={1}>{meta}</Text>
+              {r.kind === 'video' && <Text style={s.kind}>VÍDEO</Text>}
+            </View>
+            <IconBtn name="add" tone="dark" size={38} iconSize={20} onPress={() => setAdding(r)} />
+          </Pressable>
+        );
+      })}
+
+      {adding && (
+        <AddToPlaylistSheet
+          db={db} track={toInput(adding)} onClose={() => setAdding(null)}
+          onDone={(name, added) => {
+            setNotice(added ? `"${adding.title}" añadida a ${name}.` : `"${adding.title}" ya estaba en ${name}.`);
+            setAdding(null);
+          }}
+        />
+      )}
+    </ScrollView>
   );
 }
 
 const s = StyleSheet.create({
-  wrap: { alignItems: 'center', paddingVertical: 8, backgroundColor: colors.bg },
-  pill: { flexDirection: 'row', gap: 6, padding: 6, borderRadius: radius.xl, backgroundColor: colors.dark },
-  item: { width: 62, height: 46, borderRadius: radius.lg, alignItems: 'center', justifyContent: 'center' },
-  itemOn: { backgroundColor: 'rgba(244,239,230,0.16)' },
-  badge: {
-    position: 'absolute', top: 2, right: 10, minWidth: 17, height: 17, borderRadius: 9, paddingHorizontal: 4,
-    backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
+  container: { padding: 24, gap: 14, paddingBottom: 32 },
+  searchRow: { flexDirection: 'row', gap: 10 },
+  search: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, paddingHorizontal: 14,
+    backgroundColor: colors.chip, borderRadius: radius.md,
   },
-  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
+  input: { flex: 1, color: colors.text, fontSize: 15 },
+  notice: { backgroundColor: colors.chip, borderRadius: radius.md, padding: 14 },
+  noticeText: { color: colors.text, fontSize: 13, lineHeight: 19 },
+  row: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, padding: 10, paddingRight: 12,
+    backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line,
+  },
+  cover: { width: 44, height: 44, borderRadius: radius.sm, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
+  title: { color: colors.text, fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
+  meta: { color: colors.muted, fontSize: 13 },
+  kind: { color: colors.faint, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
 });
+</file>
+
+<file path="src/ui/Slider.tsx">
+import React, { useMemo, useRef, useState } from 'react';
+import { PanResponder, View } from 'react-native';
+import { clamp01 } from '../core/player/format';
+import { colors } from './theme';
+
+interface Props {
+  /** 0..1 */
+  value: number;
+  disabled?: boolean;
+  /** Mientras se arrastra (fracción 0..1), o null al soltar. */
+  onScrub?: (fraction: number | null) => void;
+  /** Al soltar. */
+  onSeek: (fraction: number) => void;
+}
+
+/** Barra de progreso arrastrable (toque o arrastre). */
+export function Slider({ value, disabled, onScrub, onSeek }: Props) {
+  const [drag, setDrag] = useState<number | null>(null);
+  const width = useRef(1);
+  const start = useRef(0);
+  const cb = useRef({ onScrub, onSeek, disabled });
+  cb.current = { onScrub, onSeek, disabled };
+
+  const pan = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => !cb.current.disabled,
+    onMoveShouldSetPanResponder: () => !cb.current.disabled,
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: e => {
+      start.current = clamp01(e.nativeEvent.locationX / width.current);
+      setDrag(start.current); cb.current.onScrub?.(start.current);
+    },
+    onPanResponderMove: (_, g) => {
+      const f = clamp01(start.current + g.dx / width.current);
+      setDrag(f); cb.current.onScrub?.(f);
+    },
+    onPanResponderRelease: (_, g) => {
+      const f = clamp01(start.current + g.dx / width.current);
+      setDrag(null); cb.current.onScrub?.(null); cb.current.onSeek(f);
+    },
+    onPanResponderTerminate: () => { setDrag(null); cb.current.onScrub?.(null); },
+  }), []);
+
+  const f = clamp01(drag ?? value);
+  return (
+    <View
+      {...pan.panHandlers}
+      onLayout={e => { width.current = Math.max(1, e.nativeEvent.layout.width); }}
+      style={{ height: 30, justifyContent: 'center' }}
+    >
+      <View pointerEvents="none" style={{ height: 4, borderRadius: 2, backgroundColor: colors.onDarkLine, overflow: 'visible' }}>
+        <View style={{ width: `${f * 100}%`, height: 4, borderRadius: 2, backgroundColor: colors.onDark }} />
+        <View style={{
+          position: 'absolute', left: `${f * 100}%`, top: -5, marginLeft: -7, width: 14, height: 14, borderRadius: 7,
+          backgroundColor: colors.onDark, opacity: drag !== null || f > 0 ? 1 : 0.6,
+        }} />
+      </View>
+    </View>
+  );
+}
 </file>
 
 <file path="src/ui/theme.ts">
@@ -1357,41 +1659,36 @@ const small: TextStyle = { color: colors.muted, fontSize: 12, lineHeight: 17 };
 export const type = { h1, h2, body, small };
 </file>
 
-<file path="src/ui/YouTubePlayer.tsx">
-import React from 'react';
-import { useWindowDimensions } from 'react-native';
-import YoutubePlayer from 'react-native-youtube-iframe';
+<file path="src/ui/usePlayerProgress.ts">
+import { RefObject, useCallback, useEffect, useState } from 'react';
+import { PlayerHandle } from './YouTubePlayer';
 
-export interface PlayerProps {
-  videoId: string;
-  playing: boolean;
-  onEnded: () => void;
-  onError: (reason: string) => void;
-  onPlayingChange: (playing: boolean) => void;
-}
+/** Posición y duración (segundos) de la canción actual, consultadas al motor mientras suena. */
+export function usePlayerProgress(engine: RefObject<PlayerHandle | null>, playing: boolean, videoId: string) {
+  const [position, setPosition] = useState(0);
+  const [duration, setDuration] = useState(0);
 
-/**
- * ÚNICO archivo que conoce el motor de reproducción (iframe oficial de YouTube).
- * Para cambiar a otra vía (p. ej. audio en segundo plano) basta con reescribir
- * este componente manteniendo las mismas props.
- */
-export function YouTubePlayer({ videoId, playing, onEnded, onError, onPlayingChange }: PlayerProps) {
-  const { width } = useWindowDimensions();
-  const w = Math.max(200, width - 48);
-  return (
-    <YoutubePlayer
-      width={w}
-      height={Math.round((w * 9) / 16)}
-      videoId={videoId}
-      play={playing}
-      onChangeState={(state: string) => {
-        if (state === 'ended') onEnded();
-        else if (state === 'playing') onPlayingChange(true);
-        else if (state === 'paused') onPlayingChange(false);
-      }}
-      onError={(reason: string) => onError(reason)}
-    />
-  );
+  useEffect(() => { setPosition(0); setDuration(0); }, [videoId]);
+
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      try {
+        const h = engine.current;
+        if (!h) return;
+        const [t, d] = await Promise.all([h.getCurrentTime(), h.getDuration()]);
+        if (!stop) { setPosition(t); setDuration(d); }
+      } catch { /* el motor aún no está listo */ }
+    };
+    tick();
+    if (!playing) return () => { stop = true; };
+    const id = setInterval(tick, 500);
+    return () => { stop = true; clearInterval(id); };
+  }, [engine, playing, videoId]);
+
+  /** Para reflejar un salto al instante sin esperar a la siguiente consulta. */
+  const set = useCallback((sec: number) => setPosition(sec), []);
+  return { position, duration, set };
 }
 </file>
 
@@ -1412,6 +1709,112 @@ export function createTestDb(): Db {
     async getFirstAsync<T>(sql: string, params?: SqlParam[]) { return (db.prepare(sql).get(...bind(params)) as T | undefined) ?? null; },
   };
 }
+</file>
+
+<file path="tests/manualSearch.test.ts">
+import { beforeEach, describe, expect, it } from 'vitest';
+import { defaultManualQuery, searchManual } from '../src/core/matching/manualSearch';
+import { SearchFn } from '../src/core/matching/matchTrack';
+import { YtResult } from '../src/providers/youtubeMusic/search';
+import { scoreCandidate } from '../src/core/matching/scoreCandidate';
+import { toCandidate } from '../src/providers/youtubeMusic/toCandidate';
+import { Db } from '../src/db/database';
+import { migrate } from '../src/db/migrations';
+import {
+  getChosenVideos, getMatchStatus, recordMatching, resolveManualFromSearch, upsertTrack,
+} from '../src/db/repository';
+import { Track } from '../src/models/Track';
+import { createTestDb } from './helpers/nodeSqliteDb';
+
+const track: Track = {
+  id: 't1', title: 'Blinding Lights', artists: ['The Weeknd'], durationMs: 200000,
+  version: 'studio', externalIds: { spotify: 'sp1' },
+};
+const yt = (videoId: string, o: Partial<YtResult> = {}): YtResult => ({
+  videoId, title: 'Blinding Lights', artists: ['The Weeknd'], durationSec: 200, kind: 'song', ...o,
+});
+
+describe('searchManual', () => {
+  it('consulta inicial: artista + título', () => {
+    expect(defaultManualQuery(track)).toBe('The Weeknd Blinding Lights');
+  });
+
+  it('consulta vacía no busca', async () => {
+    let calls = 0;
+    const search: SearchFn = async () => { calls++; return []; };
+    expect(await searchManual(track, '   ', search)).toEqual([]);
+    expect(calls).toBe(0);
+  });
+
+  it('une canciones y sin filtro, sin duplicados, y descarta "other"', async () => {
+    const search: SearchFn = async (_q, o) =>
+      o?.filter === false
+        ? [yt('A'), yt('LIVE', { title: 'Blinding Lights (Live)', kind: 'video', durationSec: 260 }), yt('X', { kind: 'other' })]
+        : [yt('A'), yt('B', { artists: ['Otro'] })];
+    const r = await searchManual(track, 'blinding', search);
+    expect(r.map(x => x.candidate.externalId).sort()).toEqual(['A', 'B', 'LIVE']);
+  });
+
+  it('ordena por puntuación y no esconde los rechazados', async () => {
+    const search: SearchFn = async () => [
+      yt('BAD', { artists: ['Otro'], durationSec: 100 }),
+      yt('GOOD'),
+    ];
+    const r = await searchManual(track, 'x', search);
+    expect(r[0].candidate.externalId).toBe('GOOD');
+    expect(r[0].result.score).toBeGreaterThan(r[1].result.score);
+    expect(r).toHaveLength(2);
+  });
+
+  it('si falla una de las búsquedas usa la otra; si fallan ambas, lanza', async () => {
+    const half: SearchFn = async (_q, o) => { if (o?.filter === false) throw new Error('boom'); return [yt('A')]; };
+    expect((await searchManual(track, 'x', half)).map(x => x.candidate.externalId)).toEqual(['A']);
+    const none: SearchFn = async () => { throw new Error('sin red'); };
+    await expect(searchManual(track, 'x', none)).rejects.toThrow('sin red');
+  });
+
+  it('limita a 15 resultados', async () => {
+    const search: SearchFn = async () => Array.from({ length: 30 }, (_, i) => yt('V' + i));
+    expect(await searchManual(track, 'x', search)).toHaveLength(15);
+  });
+});
+
+describe('resolveManualFromSearch', () => {
+  let db: Db;
+  beforeEach(async () => { db = createTestDb(); await migrate(db); await upsertTrack(db, track); });
+
+  it('guarda el vídeo elegido, aunque no estuviera entre los candidatos', async () => {
+    const c = toCandidate(yt('NEW', { title: 'Blinding Lights (Live)', kind: 'video' }));
+    await resolveManualFromSearch(db, track.id, c, scoreCandidate(track, c));
+    expect(await getMatchStatus(db, track.id)).toEqual({ status: 'manual', videoId: 'NEW' });
+  });
+
+  it('el vídeo aparece en getChosenVideos (la playlist lo muestra)', async () => {
+    await db.runAsync("INSERT INTO playlists (id, name, created_at) VALUES ('p','L',1)");
+    await db.runAsync("INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES ('p',0,?)", [track.id]);
+    const c = toCandidate(yt('NEW'));
+    await resolveManualFromSearch(db, track.id, c, scoreCandidate(track, c));
+    expect((await getChosenVideos(db, 'p'))[track.id]).toMatchObject({ title: 'Blinding Lights' });
+  });
+
+  it('corrige una coincidencia automática previa y un nuevo matching no la pisa', async () => {
+    const wrong = toCandidate(yt('WRONG'));
+    await recordMatching(db, track.id, [{ candidate: wrong, result: scoreCandidate(track, wrong) }]);
+    expect((await getMatchStatus(db, track.id))?.videoId).toBe('WRONG');
+
+    const right = toCandidate(yt('RIGHT'));
+    await resolveManualFromSearch(db, track.id, right, scoreCandidate(track, right));
+    await recordMatching(db, track.id, [{ candidate: wrong, result: scoreCandidate(track, wrong) }]);
+    expect(await getMatchStatus(db, track.id)).toEqual({ status: 'manual', videoId: 'RIGHT' });
+  });
+
+  it('elegir dos veces el mismo vídeo no falla (INSERT OR REPLACE)', async () => {
+    const c = toCandidate(yt('SAME'));
+    await resolveManualFromSearch(db, track.id, c, scoreCandidate(track, c));
+    await resolveManualFromSearch(db, track.id, c, scoreCandidate(track, c));
+    expect((await getMatchStatus(db, track.id))?.videoId).toBe('SAME');
+  });
+});
 </file>
 
 <file path="tests/matching-cases.md">
@@ -1501,6 +1904,89 @@ describe('paso 2: versiones, feat. y títulos flexibles', () => {
     const tr: Track = { ...t, title: 'Love Story', artists: ['Taylor Swift'] };
     const r = scoreCandidate(tr, cand({ title: "Love Story (Taylor's Version)", artists: ['Taylor Swift'], isrc: undefined }));
     expect(r.decision).not.toBe('auto');
+  });
+});
+</file>
+
+<file path="tests/search.test.ts">
+import { beforeEach, describe, expect, it } from 'vitest';
+import { searchSongs } from '../src/core/search/searchSongs';
+import { SearchFn } from '../src/core/matching/matchTrack';
+import { YtResult } from '../src/providers/youtubeMusic/search';
+import { Db } from '../src/db/database';
+import { migrate, SCHEMA_VERSION } from '../src/db/migrations';
+import {
+  addYoutubeTrackToPlaylist, createPlaylist, deletePlaylist, getChosenVideos, getMatchStatus,
+  getPlaylistEntries, listPlaylists,
+} from '../src/db/repository';
+import { createTestDb } from './helpers/nodeSqliteDb';
+
+const yt = (videoId: string, o: Partial<YtResult> = {}): YtResult => ({
+  videoId, title: 'Blinding Lights', artists: ['The Weeknd'], durationSec: 200, kind: 'song', ...o,
+});
+
+describe('searchSongs', () => {
+  it('consulta vacía no busca', async () => {
+    let n = 0;
+    expect(await searchSongs('  ', async () => { n++; return []; })).toEqual([]);
+    expect(n).toBe(0);
+  });
+  it('quita duplicados y "other"', async () => {
+    const r = await searchSongs('x', async () => [yt('A'), yt('A'), yt('B', { kind: 'other' }), yt('C')]);
+    expect(r.map(x => x.videoId)).toEqual(['A', 'C']);
+  });
+  it('si el filtro no devuelve nada reintenta sin filtro', async () => {
+    const search: SearchFn = async (_q, o) => (o?.filter === false ? [yt('V', { kind: 'video' }), yt('O', { kind: 'other' })] : []);
+    expect((await searchSongs('x', search)).map(x => x.videoId)).toEqual(['V']);
+  });
+  it('limita a 20', async () => {
+    expect(await searchSongs('x', async () => Array.from({ length: 40 }, (_, i) => yt('V' + i)))).toHaveLength(20);
+  });
+});
+
+describe('añadir a playlist', () => {
+  let db: Db;
+  const input = (id: string) => ({ videoId: id, title: 'Blinding Lights', artists: ['The Weeknd'], album: 'After Hours', durationMs: 200000, version: 'studio' as const });
+  beforeEach(async () => { db = createTestDb(); await migrate(db); });
+
+  it('migra a la versión 2', async () => { expect(SCHEMA_VERSION).toBe(2); });
+
+  it('crea playlist propia y rechaza nombre vacío', async () => {
+    const id = await createPlaylist(db, '  Gym  ');
+    expect((await listPlaylists(db))[0]).toMatchObject({ id, name: 'Gym', total: 0 });
+    await expect(createPlaylist(db, '   ')).rejects.toThrow();
+  });
+
+  it('añade al final, con vídeo elegido y reproducible', async () => {
+    const pl = await createPlaylist(db, 'A');
+    await addYoutubeTrackToPlaylist(db, pl, input('V1'));
+    const { added } = await addYoutubeTrackToPlaylist(db, pl, { ...input('V2'), title: 'Otra' });
+    expect(added).toBe(true);
+    const entries = await getPlaylistEntries(db, pl);
+    expect(entries.map(e => e.track.title)).toEqual(['Blinding Lights', 'Otra']);
+    expect(entries.map(e => e.videoId)).toEqual(['V1', 'V2']);
+    expect(entries[0].track.externalIds.youtubeVideo).toBe('V1');
+    expect(Object.keys(await getChosenVideos(db, pl))).toHaveLength(2);
+  });
+
+  it('no repite en la misma playlist, pero reutiliza la canción en otra', async () => {
+    const a = await createPlaylist(db, 'A'); const b = await createPlaylist(db, 'B');
+    const first = await addYoutubeTrackToPlaylist(db, a, input('V1'));
+    expect((await addYoutubeTrackToPlaylist(db, a, input('V1'))).added).toBe(false);
+    const second = await addYoutubeTrackToPlaylist(db, b, input('V1'));
+    expect(second).toEqual({ added: true, trackId: first.trackId });
+    expect(await getPlaylistEntries(db, a)).toHaveLength(1);
+    expect(await getMatchStatus(db, first.trackId)).toEqual({ status: 'manual', videoId: 'V1' });
+  });
+
+  it('borrar una playlist conserva la canción si está en otra', async () => {
+    const a = await createPlaylist(db, 'A'); const b = await createPlaylist(db, 'B');
+    const { trackId } = await addYoutubeTrackToPlaylist(db, a, input('V1'));
+    await addYoutubeTrackToPlaylist(db, b, input('V1'));
+    await deletePlaylist(db, a);
+    expect(await getMatchStatus(db, trackId)).not.toBeNull();
+    await deletePlaylist(db, b);
+    expect(await getMatchStatus(db, trackId)).toBeNull();
   });
 });
 </file>
@@ -1792,6 +2278,114 @@ Docs: https://docs.expo.dev/eas/index.md
 - Prefer recommended Expo modules over third-party libraries, and check your available skills before adding dependencies. Docs: https://docs.expo.dev/versions/latest/index.md
 </file>
 
+<file path="ARCHITECTURE.md">
+# ARCHITECTURE.md — Music Project
+
+App iOS de uso personal, sin anuncios: importa playlists de Spotify, encuentra cada canción en YouTube Music y la reproduce. Prioridad técnica: que la canción emparejada sea la correcta.
+
+## 1. Stack
+
+| Capa | Tecnología |
+|---|---|
+| App | Expo SDK ~58 · React Native 0.88 · React 19 · TypeScript (estricto) |
+| Ejecución | Expo Go (sin build nativa propia; sin cuenta Apple Developer) |
+| Base de datos | `expo-sqlite` (SQLite local, `music.db`, WAL, foreign keys) |
+| Reproducción | `react-native-youtube-iframe` + `react-native-webview` (iframe oficial de YouTube) |
+| UI | Componentes propios, `@expo/vector-icons` (Ionicons), `react-native-safe-area-context`, `Animated`/`PanResponder` de RN |
+| Tests | Vitest (`npm test`) + `node:sqlite` como BD de prueba (Node ≥ 22.13) |
+| Otros (instalados, aún sin uso) | `expo-auth-session`, `expo-secure-store`, `expo-web-browser` (para OAuth de Spotify en el futuro) |
+
+Sin servidor propio: todo corre en el móvil. Los datos (playlists, coincidencias) viven solo en la SQLite del iPhone; se pierden al desinstalar.
+
+## 2. Estructura
+
+```
+App.tsx                       Raíz: estado global, navegación por pestañas, cola de reproducción
+src/
+  models/Track.ts             Track, TrackCandidate, TrackVersion
+  core/                       Lógica pura (sin RN ni BD) → 100 % testeable
+    matching/
+      parseTitle.ts           Limpia títulos de YouTube, extrae feat. y versión
+      scoreCandidate.ts       Puntúa candidato vs canción → auto | review | reject
+      matchTrack.ts           findCandidates: busca + puntúa + ordena
+      matchQueue.ts           runMatching: cola con pausas, cancelación, corte por errores
+      manualSearch.ts         Búsqueda manual puntuada (para corregir)
+    search/searchSongs.ts     Búsqueda de la pestaña Buscar
+    player/queue.ts           buildQueue, shuffle, repetir, nextIndex
+    player/format.ts          formatClock, thumbnailUrl
+  db/
+    database.ts               Interfaz `Db` (abstrae expo-sqlite → permite tests en Node)
+    openDb.ts                 Singleton expo-sqlite + migraciones
+    migrations.ts             Esquema versionado (PRAGMA user_version), hoy v2
+    repository.ts             Todas las consultas/escrituras
+    matchingAdapter.ts        Conecta la cola de matching con el repositorio
+  importers/
+    errors.ts · spotify/{parseUrl,embed,importPlaylist}.ts
+  providers/youtubeMusic/
+    search.ts                 Cliente del endpoint interno de YT Music
+    toCandidate.ts            Resultado de YT → TrackCandidate
+  ui/                         Pantallas y componentes (theme, kit, cards, TabBar,
+                              SearchScreen, ReviewScreen, ManualSearch, AddToPlaylistSheet,
+                              MiniPlayer, NowPlaying, Cover, Slider, YouTubePlayer…)
+tests/                        Vitest (81 tests)
+```
+
+Principio: **dependencias hacia dentro**. `core/` no importa nada de RN ni de expo; `db/` depende solo de la interfaz `Db`; `ui/` y `App.tsx` unen las piezas. El único archivo que conoce el motor de reproducción es `ui/YouTubePlayer.tsx` (cambiable sin tocar el resto).
+
+## 3. Modelo de datos (SQLite)
+
+- `tracks` — canción interna (`id`, título, artistas JSON, duración, versión, `spotify_id` UNIQUE, `youtube_id` UNIQUE parcial para las añadidas desde la búsqueda).
+- `playlists` — `spotify_id` UNIQUE (nulo en playlists propias).
+- `playlist_tracks` — PK (playlist, posición) → orden.
+- `candidates` — candidatos guardados por canción con score, decisión, motivos, conflictos y avisos. PK (track, provider, external_id).
+- `matches` — resultado por canción: `status` ∈ `auto | manual | pending | none`, `video_id`, score.
+
+Migraciones transaccionales y secuenciales. Reglas: una elección `manual` nunca la pisa un nuevo matching; reimportar una playlist de Spotify actualiza en vez de duplicar.
+
+## 4. Flujos principales
+
+**Importar (Spotify).** Se pega el enlace → `parsePlaylistId` → se descarga la página embed pública `open.spotify.com/embed/playlist/{id}` → se lee el JSON de `__NEXT_DATA__` (`trackList`) con búsqueda recursiva tolerante a cambios → `parseTitle` por canción → todo en una transacción. Límite ~100 canciones, sin ISRC ni álbum. No usa la Web API oficial (desde 2026 no devuelve playlists ajenas).
+
+**Matching.** Por canción: `findCandidates` consulta YT Music (filtro «Canciones»; si no hay resultados, reintenta sin filtro) y `scoreCandidate` puntúa:
+ISRC +40 · artista principal +25 (secundario +12) · título exacto +15 (similar +10) · duración ±2 s +10 (±5 s +5) · misma versión +10.
+Decisión: `auto` (sin conflictos y metadatos estrictos), `review` (score ≥ 40 sin conflicto), `reject`. `runMatching` espacia las búsquedas (800 ms + hasta 50 % aleatorio), admite cancelación y se detiene tras 5 errores seguidos. Las `auto` se guardan solas; las dudosas van a la pestaña Revisar.
+
+**Revisión y corrección.** `ReviewScreen` muestra candidatos guardados (elegir, escuchar, ninguno, saltar). `ManualSearch` permite una búsqueda libre sobre cualquier canción y guarda la elección como `manual`.
+
+**Buscar y añadir.** La pestaña Buscar usa `searchSongs`; un resultado se reproduce directamente o se añade (`addYoutubeTrackToPlaylist`, transaccional, sin duplicar en la misma playlist) a una playlist existente o nueva.
+
+**Reproducción.** `App.tsx` mantiene la cola (`base`/`queue`/`nowIdx`), aleatorio y repetir (off/all/one). `YouTubePlayer` es un iframe oficial en un WebView invisible (recortado al tamaño del botón de play, opacidad 0.05). Detalles críticos aprendidos:
+- iOS exige un toque dentro del WebView en la primera reproducción → el reproductor invisible se coloca sobre el botón ▶ del mini-reproductor (`catchTap`) hasta el primer evento `playing`.
+- El contenedor nunca cambia de tamaño/posición (iOS pausaba al hacerlo).
+- `NowPlaying` es una capa `Animated.View` dentro de la app, **no un `Modal` nativo** (un Modal a pantalla completa saca el WebView de la ventana y lo pausa).
+- El progreso se sondea cada 500 ms con `getCurrentTime/getDuration` desde el propio mini-reproductor/pantalla (así `App` no se redibuja).
+- Portadas: miniatura `i.ytimg.com/vi/{id}/hqdefault.jpg` recortada al cuadrado (fallback: disco generado).
+
+## 5. UI
+
+Estilo propio: fondo crema, marrón oscuro para superficies de contraste, óxido como color de acción (`ui/theme.ts`, `ui/kit.tsx`). Navegación por pestañas flotantes (Biblioteca / Buscar / Revisar) gestionada con estado en `App.tsx` (sin librería de navegación). Hojas de apoyo (`ManualSearch`, `AddToPlaylistSheet`) son `Modal` `pageSheet`.
+
+## 6. Integraciones no oficiales (riesgo)
+
+Uso personal, aceptado explícitamente por el proyecto:
+- **Spotify**: página embed pública (no documentada).
+- **YouTube Music**: endpoint interno `youtubei/v1/search` (cliente `WEB_REMIX`), valor de filtro `SONGS_FILTER` tomado de ytmusicapi.
+- Ambas pueden cambiar sin aviso; el parseo es tolerante y hay reintentos/diagnóstico, pero pueden romperse.
+
+## 7. Tests y calidad
+
+81 tests Vitest: puntuación y casos de matching, parseo de títulos, importador de Spotify, cliente de YT Music, cola y shuffle, repositorio (con `node:sqlite` en memoria vía adaptador `Db`), búsqueda manual y añadir a playlist. **No hay tests de UI**; las pantallas se verifican a mano en el iPhone. Comandos: `npx vitest run`, `npx tsc --noEmit` (ejecutar dentro de la carpeta del proyecto).
+
+## 8. Limitaciones conocidas
+
+- Sin reproducción en segundo plano (el WebView se pausa al bloquear): haría falta reproductor nativo + build propia (no posible con Expo Go).
+- Spotify: máx. ~100 canciones por playlist, sin ISRC.
+- Reimportar una playlist de Spotify borra las canciones añadidas a mano a esa misma playlist.
+- Algunos vídeos no permiten reproducción embebida (se salta al siguiente).
+- Datos solo locales (sin copia de seguridad ni sincronización).
+- Pendientes razonables: quitar/reordenar canciones, exportar/importar `music.db`, OAuth de Spotify para listas largas, degradado de fondo (`expo-linear-gradient`).
+</file>
+
 <file path="eas.json">
 {
   "cli": {
@@ -1893,149 +2487,563 @@ Cada candidato recibe una puntuación y una decisión: `auto`, `review` o `rejec
 }
 </file>
 
-<file path="src/core/player/queue.ts">
-export interface QueueItem {
-  trackId: string;
-  videoId: string;
-  title: string;
-  artists: string[];
-}
+<file path="src/db/migrations.ts">
+import { Db } from './database';
 
-interface EntryLike {
-  track: { id: string; title: string; artists: string[] };
-  status: string | null;
-  videoId: string | null;
-}
+/** Cada elemento es una versión del esquema; se aplican en orden. */
+const MIGRATIONS: string[][] = [
+  [
+    `CREATE TABLE tracks (
+      id TEXT PRIMARY KEY,
+      spotify_id TEXT UNIQUE,
+      title TEXT NOT NULL,
+      artists TEXT NOT NULL,
+      album TEXT,
+      duration_ms INTEGER,
+      isrc TEXT,
+      version TEXT NOT NULL,
+      musicbrainz_id TEXT,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE TABLE playlists (
+      id TEXT PRIMARY KEY,
+      spotify_id TEXT UNIQUE,
+      name TEXT NOT NULL,
+      source_url TEXT,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE TABLE playlist_tracks (
+      playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL,
+      track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      PRIMARY KEY (playlist_id, position)
+    )`,
+    `CREATE TABLE candidates (
+      track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL,
+      external_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artists TEXT NOT NULL,
+      duration_ms INTEGER,
+      version TEXT NOT NULL,
+      score REAL NOT NULL,
+      decision TEXT NOT NULL,
+      reasons TEXT NOT NULL,
+      conflicts TEXT NOT NULL,
+      warnings TEXT NOT NULL,
+      PRIMARY KEY (track_id, provider, external_id)
+    )`,
+    `CREATE TABLE matches (
+      track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+      video_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('auto','manual','pending','none')),
+      score REAL,
+      updated_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX idx_matches_status ON matches(status)`,
+    `CREATE INDEX idx_playlist_tracks_track ON playlist_tracks(track_id)`,
+  ],
+  // v2: canciones añadidas desde la búsqueda (sin id de Spotify, identificadas por su vídeo de YouTube).
+  [
+    `ALTER TABLE tracks ADD COLUMN youtube_id TEXT`,
+    `CREATE UNIQUE INDEX idx_tracks_youtube ON tracks(youtube_id) WHERE youtube_id IS NOT NULL`,
+  ],
+];
 
-/** Cola de reproducción: solo canciones con vídeo resuelto (auto o manual), en el orden de la playlist. */
-export function buildQueue(entries: EntryLike[]): QueueItem[] {
-  return entries
-    .filter(e => (e.status === 'auto' || e.status === 'manual') && e.videoId)
-    .map(e => ({ trackId: e.track.id, videoId: e.videoId as string, title: e.track.title, artists: e.track.artists }));
-}
+export const SCHEMA_VERSION = MIGRATIONS.length;
 
-/** Índice siguiente/anterior, o null si se sale de la cola. */
-export function stepIndex(index: number, length: number, dir: 1 | -1): number | null {
-  const n = index + dir;
-  return n >= 0 && n < length ? n : null;
-}
-
-/**
- * Mezcla la cola (Fisher-Yates). Si se indica `firstTrackId`, esa canción queda
- * la primera y el resto se mezcla. `random` es inyectable para los tests.
- */
-export function shuffleQueue(items: QueueItem[], firstTrackId?: string, random: () => number = Math.random): QueueItem[] {
-  const first = firstTrackId ? items.find(i => i.trackId === firstTrackId) : undefined;
-  const rest = items.filter(i => i !== first);
-  for (let i = rest.length - 1; i > 0; i--) {
-    const j = Math.floor(random() * (i + 1));
-    [rest[i], rest[j]] = [rest[j], rest[i]];
+export async function migrate(db: Db): Promise<number> {
+  const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
+  let version = row?.user_version ?? 0;
+  for (; version < MIGRATIONS.length; version++) {
+    await db.execAsync('BEGIN');
+    try {
+      for (const statement of MIGRATIONS[version]) await db.execAsync(statement);
+      await db.execAsync(`PRAGMA user_version = ${version + 1}`);
+      await db.execAsync('COMMIT');
+    } catch (error) {
+      await db.execAsync('ROLLBACK');
+      throw error;
+    }
   }
-  return first ? [first, ...rest] : rest;
+  return version;
 }
 </file>
 
-<file path="src/ui/ReviewScreen.tsx">
-import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Linking, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { Db } from '../db/database';
-import { listPendingReviews, markNone, PendingReview, resolveManual } from '../db/repository';
-import { Btn } from './kit';
-import { colors, radius, type } from './theme';
+<file path="src/ui/cards.tsx">
+import React from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { PlaylistInfo } from '../db/repository';
+import { Disc, Icon, StatusDot } from './kit';
+import { colors, radius } from './theme';
 
-const fmt = (ms?: number): string => {
-  if (!ms) return '—';
-  const s = Math.round(ms / 1000);
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-};
-
-export function ReviewScreen({ db, onChanged }: { db: Db; onChanged?: () => void }) {
-  const [items, setItems] = useState<PendingReview[] | null>(null);
-  const [i, setI] = useState(0);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    setItems(await listPendingReviews(db));
-    setI(0);
-  }, [db]);
-  useEffect(() => { load(); }, [load]);
-
-  const act = async (fn: () => Promise<void>) => {
-    if (busy) return;
-    setBusy(true);
-    try { await fn(); await load(); onChanged?.(); } finally { setBusy(false); }
-  };
-
-  const cur = items && items.length > 0 ? items[i % items.length] : null;
-
+/** Tarjeta de playlist: zona clara con el disco y franja marrón con el nombre. */
+export function PlaylistCard({ info, width, onPress, onDelete }: {
+  info: PlaylistInfo; width: number; onPress: () => void; onDelete: () => void;
+}) {
+  const meta = info.pending > 0 ? `${info.pending} dudosas` : `${info.total} canciones`;
   return (
-    <ScrollView contentContainerStyle={s.container}>
-      <Text style={type.small}>Coincidencias dudosas</Text>
-      <Text style={type.h1}>Revisar</Text>
+    <Pressable onPress={onPress} style={[s.card, { width }]}>
+      <View style={[s.top, { height: width * 0.78 }]}>
+        <Disc seed={info.name} size={width * 0.54} />
+      </View>
+      <View style={s.bottom}>
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text style={s.meta} numberOfLines={1}>{meta}</Text>
+          <Text style={s.name} numberOfLines={1}>{info.name}</Text>
+        </View>
+        <Pressable onPress={onDelete} hitSlop={8} style={s.round}>
+          <Icon name="trash-outline" size={15} color={colors.dark} />
+        </Pressable>
+      </View>
+    </Pressable>
+  );
+}
 
-      {items === null && <ActivityIndicator color={colors.accent} />}
-      {items && items.length === 0 && (
-        <View style={s.empty}><Text style={type.body}>No queda nada pendiente. Todo en orden.</Text></View>
+/** Fila de canción con el vídeo elegido debajo. */
+export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress, onSearch }: {
+  index: number; title: string; artists: string; videoCaption?: string; status: string | null;
+  isNow: boolean; playable: boolean; onPress: () => void; onSearch?: () => void;
+}) {
+  return (
+    <Pressable onPress={onPress} disabled={!playable} style={s.row}>
+      <View style={[s.num, isNow && { backgroundColor: colors.accent }]}>
+        {isNow
+          ? <Icon name="musical-notes" size={16} color={colors.onAccent} />
+          : <Text style={s.numText}>{String(index).padStart(2, '0')}</Text>}
+      </View>
+      <View style={{ flex: 1, gap: 1 }}>
+        <Text style={[s.title, isNow && { color: colors.accent }]} numberOfLines={1}>{title}</Text>
+        <Text style={s.artist} numberOfLines={1}>{artists}</Text>
+        {videoCaption ? <Text style={s.caption} numberOfLines={1}>{videoCaption}</Text> : null}
+      </View>
+      {onSearch && (
+        <Pressable onPress={onSearch} hitSlop={10} style={s.searchBtn}>
+          <Icon name="search" size={15} color={colors.muted} />
+        </Pressable>
       )}
-
-      {cur && items && (
-        <>
-          <Text style={type.small}>{(i % items.length) + 1} de {items.length} pendientes</Text>
-
-          <View style={s.original}>
-            <Text style={s.originalLabel}>EN SPOTIFY</Text>
-            <Text style={s.originalTitle}>{cur.track.title}</Text>
-            <Text style={s.originalMeta}>
-              {cur.track.artists.join(', ')} · {fmt(cur.track.durationMs)}
-              {cur.track.version !== 'studio' ? ` · ${cur.track.version}` : ''}
-            </Text>
-          </View>
-
-          {cur.candidates.slice(0, 3).map(c => {
-            const notes = [...c.conflicts, ...c.warnings];
-            return (
-              <View key={c.externalId} style={s.cand}>
-                <View style={s.candHead}>
-                  <Text style={s.candLabel}>CANDIDATO</Text>
-                  <Text style={s.score}>{Math.round(c.score)} pts</Text>
-                </View>
-                <Text style={s.candTitle}>{c.title}</Text>
-                <Text style={type.body}>{c.artists.join(', ') || 'Artista desconocido'} · {fmt(c.durationMs)}</Text>
-                {c.reasons.length > 0 && <Text style={s.good}>{c.reasons.join(' · ')}</Text>}
-                {notes.length > 0 && <Text style={s.warn}>{notes.join(' · ')}</Text>}
-                <View style={s.row}>
-                  <Btn flex label="Elegir" disabled={busy} onPress={() => act(() => resolveManual(db, cur.track.id, c.externalId))} />
-                  <Btn flex tone="soft" icon="play" label="Escuchar" onPress={() => Linking.openURL(`https://music.youtube.com/watch?v=${c.externalId}`)} />
-                </View>
-              </View>
-            );
-          })}
-
-          <View style={s.row}>
-            <Btn flex tone="soft" label="Ninguno es correcto" disabled={busy} onPress={() => act(() => markNone(db, cur.track.id))} />
-            {items.length > 1 && <Btn flex tone="soft" label="Saltar" onPress={() => setI(n => n + 1)} />}
-          </View>
-        </>
-      )}
-    </ScrollView>
+      <StatusDot status={status} />
+    </Pressable>
   );
 }
 
 const s = StyleSheet.create({
-  container: { padding: 24, gap: 14, paddingBottom: 32 },
-  empty: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 18, borderWidth: 1, borderColor: colors.line },
-  original: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 20, gap: 4 },
-  originalLabel: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
-  originalTitle: { color: colors.onDark, fontSize: 24, lineHeight: 29, fontWeight: '800', letterSpacing: -0.5 },
-  originalMeta: { color: colors.onDarkMuted, fontSize: 14 },
-  cand: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 16, gap: 6, borderWidth: 1, borderColor: colors.line },
-  candHead: { flexDirection: 'row', justifyContent: 'space-between' },
-  candLabel: { color: colors.faint, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
-  score: { color: colors.gold, fontSize: 12, fontWeight: '800' },
-  candTitle: { color: colors.text, fontSize: 17, fontWeight: '800', letterSpacing: -0.3 },
-  good: { color: colors.gold, fontSize: 12 },
-  warn: { color: colors.terracotta, fontSize: 12 },
-  row: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  card: { borderRadius: radius.lg, overflow: 'hidden', backgroundColor: colors.chip },
+  top: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.chip },
+  bottom: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.dark, padding: 12, borderRadius: radius.lg },
+  meta: { color: colors.onDarkMuted, fontSize: 11 },
+  name: { color: colors.onDark, fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
+  round: { width: 30, height: 30, borderRadius: 15, backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center' },
+  row: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, padding: 10, paddingRight: 16,
+    backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line,
+  },
+  num: { width: 40, height: 40, borderRadius: radius.sm, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
+  searchBtn: { width: 32, height: 32, borderRadius: 16, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
+  numText: { color: colors.muted, fontSize: 13, fontWeight: '700' },
+  title: { color: colors.text, fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
+  artist: { color: colors.muted, fontSize: 13 },
+  caption: { color: colors.faint, fontSize: 11, fontStyle: 'italic' },
+});
+</file>
+
+<file path="src/ui/kit.tsx">
+import React from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import { colors, radius } from './theme';
+
+/* ---------- Iconos (Ionicons) ---------- */
+export type IconName = React.ComponentProps<typeof Ionicons>['name'];
+
+export function Icon({ name, size = 20, color = colors.text }: { name: IconName; size?: number; color?: string }) {
+  return <Ionicons name={name} size={size} color={color} />;
+}
+
+/* ---------- Botón cuadrado redondeado con icono ---------- */
+type IconTone = 'soft' | 'accent' | 'dark' | 'ghost' | 'light';
+const ICON_BG: Record<IconTone, string> = { soft: colors.chip, accent: colors.accent, dark: colors.dark, ghost: 'transparent', light: 'transparent' };
+const ICON_FG: Record<IconTone, string> = { soft: colors.text, accent: colors.onAccent, dark: colors.onDark, ghost: colors.text, light: colors.onDark };
+
+export function IconBtn({ name, onPress, tone = 'soft', size = 46, iconSize = 20, badge, disabled }: {
+  name: IconName; onPress: () => void; tone?: IconTone; size?: number; iconSize?: number; badge?: number; disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress} disabled={disabled} hitSlop={6}
+      style={({ pressed }) => ({
+        width: size, height: size, borderRadius: radius.md, backgroundColor: ICON_BG[tone],
+        alignItems: 'center', justifyContent: 'center', opacity: disabled ? 0.35 : pressed ? 0.8 : 1,
+      })}
+    >
+      <Icon name={name} size={iconSize} color={ICON_FG[tone]} />
+      {badge ? (
+        <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View>
+      ) : null}
+    </Pressable>
+  );
+}
+
+/* ---------- Botón con texto ---------- */
+type BtnTone = 'accent' | 'dark' | 'soft' | 'light';
+const BTN_BG: Record<BtnTone, string> = { accent: colors.accent, dark: colors.dark, soft: colors.chip, light: colors.onDark };
+const BTN_FG: Record<BtnTone, string> = { accent: colors.onAccent, dark: colors.onDark, soft: colors.text, light: colors.dark };
+
+export function Btn({ label, onPress, tone = 'accent', disabled, busy, flex, icon }: {
+  label: string; onPress: () => void; tone?: BtnTone; disabled?: boolean; busy?: boolean; flex?: boolean; icon?: IconName;
+}) {
+  return (
+    <Pressable
+      onPress={onPress} disabled={disabled || busy}
+      style={({ pressed }) => [
+        s.btn, { backgroundColor: BTN_BG[tone] }, flex && { flex: 1 },
+        (disabled || pressed) && { opacity: disabled ? 0.4 : 0.85 },
+      ]}
+    >
+      {busy ? <ActivityIndicator color={BTN_FG[tone]} /> : (
+        <View style={s.btnInner}>
+          {icon && <Icon name={icon} size={17} color={BTN_FG[tone]} />}
+          <Text style={[s.btnText, { color: BTN_FG[tone] }]}>{label}</Text>
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
+/* ---------- Chip de filtro ---------- */
+export function Chip({ label, selected, onPress, tone = 'accent' }: {
+  label: string; selected: boolean; onPress: () => void; tone?: 'accent' | 'dark';
+}) {
+  const on = tone === 'dark' ? colors.dark : colors.accent;
+  return (
+    <Pressable onPress={onPress} style={[s.chip, { backgroundColor: selected ? on : colors.chip }]}>
+      <Text style={[s.chipText, { color: selected ? colors.onAccent : colors.text }]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+/* ---------- Disco (portada sin imagen) ---------- */
+const TINTS = ['#6B3F22', '#8A5A33', '#9A5A3A', '#5A3A28', '#7C4A2D', '#946B45'];
+const hash = (v: string) => { let h = 0; for (let i = 0; i < v.length; i++) h = (h * 31 + v.charCodeAt(i)) | 0; return Math.abs(h); };
+
+export function Disc({ seed, size = 56 }: { seed: string; size?: number }) {
+  const ring = (f: number, o: number) => ({
+    position: 'absolute' as const, width: size * f, height: size * f, borderRadius: (size * f) / 2,
+    borderWidth: 1, borderColor: `rgba(244,239,230,${o})`,
+  });
+  return (
+    <View style={{
+      width: size, height: size, borderRadius: size / 2, backgroundColor: TINTS[hash(seed) % TINTS.length],
+      alignItems: 'center', justifyContent: 'center',
+    }}>
+      <View style={ring(0.86, 0.16)} />
+      <View style={ring(0.66, 0.12)} />
+      <View style={ring(0.46, 0.1)} />
+      <View style={{ width: size * 0.28, height: size * 0.28, borderRadius: size * 0.14, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: size * 0.07, height: size * 0.07, borderRadius: size * 0.035, backgroundColor: colors.dark }} />
+      </View>
+    </View>
+  );
+}
+
+/* ---------- Estado de coincidencia ---------- */
+export function StatusDot({ status }: { status: string | null }) {
+  const filled = status === 'auto' ? colors.dark : status === 'manual' ? colors.gold : status === 'pending' ? colors.terracotta : null;
+  return (
+    <View style={{
+      width: 9, height: 9, borderRadius: 5, backgroundColor: filled ?? 'transparent',
+      borderWidth: filled ? 0 : 1.5, borderColor: colors.faint,
+    }} />
+  );
+}
+
+const s = StyleSheet.create({
+  badge: {
+    position: 'absolute', top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 4,
+    backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
+  },
+  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
+  btn: { borderRadius: radius.md, paddingVertical: 15, paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
+  btnInner: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  btnText: { fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
+  chip: { borderRadius: radius.sm, paddingVertical: 10, paddingHorizontal: 16 },
+  chipText: { fontSize: 13, fontWeight: '700' },
+});
+</file>
+
+<file path="src/ui/MiniPlayer.tsx">
+import React, { ReactNode, useEffect, useRef } from 'react';
+import { Animated, Easing, Pressable, StyleSheet, Text, View } from 'react-native';
+import { QueueItem } from '../core/player/queue';
+import { Cover } from './Cover';
+import { Icon } from './kit';
+import { colors, radius } from './theme';
+
+export const MINI_BUTTON = 38;
+
+/** Aro que late alrededor del botón de play mientras se espera el primer toque. */
+function Pulse() {
+  const t = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.timing(t, { toValue: 1, duration: 1400, easing: Easing.out(Easing.ease), useNativeDriver: true }));
+    loop.start();
+    return () => loop.stop();
+  }, [t]);
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[s.pulse, { opacity: t.interpolate({ inputRange: [0, 1], outputRange: [0.6, 0] }), transform: [{ scale: t.interpolate({ inputRange: [0, 1], outputRange: [1, 1.9] }) }] }]}
+    />
+  );
+}
+
+/**
+ * Barra compacta de "ahora suena". Tocarla abre la pantalla completa.
+ * `engine` es el reproductor (invisible): vive dentro del botón de play para poder
+ * recibir el primer toque que exige iOS. Mientras `awaitingTap`, el botón late y avisa.
+ */
+export function MiniPlayer({ item, playing, progress, awaitingTap, engine, onOpen, onToggle, onNext }: {
+  item: QueueItem; playing: boolean; progress: number; awaitingTap: boolean; engine: ReactNode;
+  onOpen: () => void; onToggle: () => void; onNext: () => void;
+}) {
+  return (
+    <Pressable onPress={onOpen} style={s.wrap}>
+      <View style={s.row}>
+        <Cover videoId={item.videoId} size={46} radius={radius.sm} seed={item.title} />
+        <View style={{ flex: 1, gap: 1 }}>
+          <Text style={s.title} numberOfLines={1}>{item.title}</Text>
+          {awaitingTap
+            ? <Text style={s.hint} numberOfLines={1}>Toca ▶ para empezar</Text>
+            : <Text style={s.artist} numberOfLines={1}>{item.artists.join(', ')}</Text>}
+        </View>
+        <View style={s.host}>
+          {awaitingTap && <Pulse />}
+          <Pressable onPress={onToggle} hitSlop={8} style={s.main}>
+            <Icon name={playing && !awaitingTap ? 'pause' : 'play'} size={20} color={colors.dark} />
+          </Pressable>
+          {engine}
+        </View>
+        <Pressable onPress={onNext} hitSlop={10}><Icon name="play-skip-forward" size={22} color={colors.onDark} /></Pressable>
+      </View>
+      <View style={s.bar}><View style={[s.fill, { width: `${Math.min(100, Math.max(0, progress * 100))}%` }]} /></View>
+    </Pressable>
+  );
+}
+
+const s = StyleSheet.create({
+  wrap: { backgroundColor: colors.dark, borderRadius: radius.lg, marginHorizontal: 12, marginTop: 8, padding: 10, gap: 8 },
+  row: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  title: { color: colors.onDark, fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
+  artist: { color: colors.onDarkMuted, fontSize: 12 },
+  hint: { color: colors.gold, fontSize: 12, fontWeight: '700' },
+  host: { width: MINI_BUTTON, height: MINI_BUTTON },
+  main: { width: MINI_BUTTON, height: MINI_BUTTON, borderRadius: MINI_BUTTON / 2, backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center' },
+  pulse: { position: 'absolute', left: 0, top: 0, width: MINI_BUTTON, height: MINI_BUTTON, borderRadius: MINI_BUTTON / 2, backgroundColor: colors.onDark },
+  bar: { height: 3, borderRadius: 2, backgroundColor: colors.onDarkLine, overflow: 'hidden', marginHorizontal: 2 },
+  fill: { height: 3, backgroundColor: colors.onDark },
+});
+</file>
+
+<file path="src/ui/NowPlaying.tsx">
+import React, { RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { Animated, BackHandler, Easing, PanResponder, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { formatClock } from '../core/player/format';
+import { QueueItem, RepeatMode } from '../core/player/queue';
+import { Cover } from './Cover';
+import { Icon, IconBtn } from './kit';
+import { Slider } from './Slider';
+import { colors, radius } from './theme';
+import { usePlayerProgress } from './usePlayerProgress';
+import { PlayerHandle } from './YouTubePlayer';
+
+interface Props {
+  item: QueueItem;
+  /** "Reproduciendo desde": nombre de la playlist o "Búsqueda". */
+  source: string;
+  playing: boolean;
+  shuffle: boolean;
+  repeat: RepeatMode;
+  engine: RefObject<PlayerHandle | null>;
+  onClose: () => void;
+  onToggle: () => void;
+  onNext: () => void;
+  onPrev: () => void;
+  onToggleShuffle: () => void;
+  onCycleRepeat: () => void;
+}
+
+/**
+ * Pantalla completa de reproducción (estilo app de streaming, con nuestra paleta).
+ * IMPORTANTE: es una capa dentro de la propia app, NO un modal nativo. Un modal a pantalla
+ * completa hace que iOS retire la vista de debajo de la ventana y el reproductor (WebView) se pausa.
+ * Debe renderizarse como hermano del contenido, a nivel raíz, y dentro de un SafeAreaProvider.
+ */
+export function NowPlaying(p: Props) {
+  const { height } = useWindowDimensions();
+  const y = useRef(new Animated.Value(height)).current;
+  const onClose = useRef(p.onClose);
+  onClose.current = p.onClose;
+
+  useEffect(() => {
+    Animated.timing(y, { toValue: 0, duration: 300, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [y]);
+
+  const close = () => {
+    Animated.timing(y, { toValue: height, duration: 240, easing: Easing.in(Easing.cubic), useNativeDriver: true })
+      .start(({ finished }) => { if (finished) onClose.current(); });
+  };
+  const closeRef = useRef(close);
+  closeRef.current = close;
+
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => { closeRef.current(); return true; });
+    return () => sub.remove();
+  }, []);
+
+  /* Arrastrar hacia abajo desde la cabecera cierra la pantalla. */
+  const drag = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) => g.dy > 8 && Math.abs(g.dy) > Math.abs(g.dx),
+    onPanResponderMove: (_, g) => { if (g.dy > 0) y.setValue(g.dy); },
+    onPanResponderRelease: (_, g) => {
+      if (g.dy > 110 || g.vy > 1.2) closeRef.current();
+      else Animated.spring(y, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
+    },
+  }), [y]);
+
+  return (
+    <Animated.View style={[s.overlay, { transform: [{ translateY: y }] }]}>
+      <Inner {...p} onClose={close} dragHandlers={drag.panHandlers} />
+    </Animated.View>
+  );
+}
+
+function Inner({ item, source, playing, shuffle, repeat, engine, onClose, onToggle, onNext, onPrev, onToggleShuffle, onCycleRepeat, dragHandlers }: Props & { dragHandlers: object }) {
+  const insets = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  const { position, duration, set } = usePlayerProgress(engine, playing, item.videoId);
+  const [scrub, setScrub] = useState<number | null>(null);
+
+  const cover = Math.min(width - 56, height * 0.4);
+  const fraction = duration > 0 ? position / duration : 0;
+  const shown = scrub !== null ? scrub * duration : position;
+
+  return (
+    <View style={[s.root, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 16 }]}>
+      <View style={s.top} {...dragHandlers}>
+        <IconBtn name="chevron-down" tone="light" onPress={onClose} iconSize={26} />
+        <View style={{ flex: 1, alignItems: 'center', gap: 2 }}>
+          <Text style={s.kicker}>REPRODUCIENDO DESDE</Text>
+          <Text style={s.source} numberOfLines={1}>{source}</Text>
+        </View>
+        <View style={{ width: 46 }} />
+      </View>
+
+      <View style={s.coverWrap}>
+        <View style={s.shadow}><Cover videoId={item.videoId} size={cover} radius={radius.xl} seed={item.title} /></View>
+      </View>
+
+      <View style={s.info}>
+        <Text style={s.title} numberOfLines={2}>{item.title}</Text>
+        <Text style={s.artist} numberOfLines={1}>{item.artists.join(', ')}</Text>
+      </View>
+
+      <View style={s.progress}>
+        <Slider
+          value={fraction} disabled={duration <= 0} onScrub={setScrub}
+          onSeek={f => { engine.current?.seekTo(f * duration); set(f * duration); }}
+        />
+        <View style={s.times}>
+          <Text style={s.time}>{formatClock(shown)}</Text>
+          <Text style={s.time}>{duration > 0 ? formatClock(duration) : '--:--'}</Text>
+        </View>
+      </View>
+
+      <View style={s.controls}>
+        <IconBtn name="shuffle" tone={shuffle ? 'accent' : 'light'} size={46} iconSize={20} onPress={onToggleShuffle} />
+        <Icon3 name="play-skip-back" onPress={onPrev} />
+        <View style={s.main}>
+          <IconBtn name={playing ? 'pause' : 'play'} tone="ghost" size={76} iconSize={34} onPress={onToggle} />
+        </View>
+        <Icon3 name="play-skip-forward" onPress={onNext} />
+        <View>
+          <IconBtn name="repeat" tone={repeat === 'off' ? 'light' : 'accent'} size={46} iconSize={20} onPress={onCycleRepeat} />
+          {repeat === 'one' && <View style={s.one}><Text style={s.oneText}>1</Text></View>}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+/** Icono grande de transporte (anterior/siguiente). */
+function Icon3({ name, onPress }: { name: 'play-skip-back' | 'play-skip-forward'; onPress: () => void }) {
+  return <IconBtn name={name} tone="light" size={56} iconSize={30} onPress={onPress} />;
+}
+
+const s = StyleSheet.create({
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 100, backgroundColor: colors.dark },
+  root: { flex: 1, backgroundColor: colors.dark, paddingHorizontal: 24, justifyContent: 'space-between' },
+  top: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  kicker: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  source: { color: colors.onDark, fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
+  coverWrap: { alignItems: 'center', justifyContent: 'center' },
+  shadow: {
+    borderRadius: radius.xl,
+    shadowColor: '#000', shadowOpacity: 0.35, shadowRadius: 24, shadowOffset: { width: 0, height: 12 }, elevation: 12,
+  },
+  info: { gap: 4 },
+  title: { color: colors.onDark, fontSize: 26, lineHeight: 31, fontWeight: '800', letterSpacing: -0.7 },
+  artist: { color: colors.onDarkMuted, fontSize: 17, fontWeight: '600' },
+  progress: { gap: 2 },
+  times: { flexDirection: 'row', justifyContent: 'space-between' },
+  time: { color: colors.onDarkMuted, fontSize: 12, fontWeight: '600' },
+  controls: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  main: { width: 76, height: 76, borderRadius: 38, backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center' },
+  one: {
+    position: 'absolute', top: 4, right: 4, width: 14, height: 14, borderRadius: 7,
+    backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center',
+  },
+  oneText: { color: colors.dark, fontSize: 9, fontWeight: '800' },
+});
+</file>
+
+<file path="src/ui/TabBar.tsx">
+import React from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Icon, IconName } from './kit';
+import { colors, radius } from './theme';
+
+export type Tab = 'library' | 'search' | 'review';
+
+/** Barra flotante en forma de píldora marrón. */
+export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab) => void; pending: number }) {
+  const item = (t: Tab, icon: IconName, badge?: number) => (
+    <Pressable onPress={() => onChange(t)} style={[s.item, tab === t && s.itemOn]}>
+      <Icon name={icon} size={22} color={tab === t ? colors.onDark : colors.onDarkMuted} />
+      {badge ? <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View> : null}
+    </Pressable>
+  );
+  return (
+    <View style={s.wrap}>
+      <View style={s.pill}>
+        {item('library', tab === 'library' ? 'albums' : 'albums-outline')}
+        {item('search', tab === 'search' ? 'search' : 'search-outline')}
+        {item('review', tab === 'review' ? 'checkmark-done' : 'checkmark-done-outline', pending)}
+      </View>
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  wrap: { alignItems: 'center', paddingVertical: 8, backgroundColor: colors.bg },
+  pill: { flexDirection: 'row', gap: 6, padding: 6, borderRadius: radius.xl, backgroundColor: colors.dark },
+  item: { width: 62, height: 46, borderRadius: radius.lg, alignItems: 'center', justifyContent: 'center' },
+  itemOn: { backgroundColor: 'rgba(244,239,230,0.16)' },
+  badge: {
+    position: 'absolute', top: 2, right: 10, minWidth: 17, height: 17, borderRadius: 9, paddingHorizontal: 4,
+    backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
+  },
+  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
 });
 </file>
 
@@ -2121,44 +3129,6 @@ describe('runMatching', () => {
 });
 </file>
 
-<file path="tests/queue.test.ts">
-import { describe, expect, it } from 'vitest';
-import { buildQueue, shuffleQueue, stepIndex } from '../src/core/player/queue';
-
-const e = (id: string, status: string | null, videoId: string | null) => ({
-  track: { id, title: 'T' + id, artists: ['A'] }, status, videoId,
-});
-
-describe('cola de reproducción', () => {
-  it('solo incluye canciones resueltas, en orden', () => {
-    const q = buildQueue([e('1', 'auto', 'v1'), e('2', 'pending', null), e('3', 'none', null), e('4', 'manual', 'v4'), e('5', 'auto', null)]);
-    expect(q.map(i => i.videoId)).toEqual(['v1', 'v4']);
-    expect(q[1]).toMatchObject({ trackId: '4', title: 'T4', artists: ['A'] });
-  });
-  it('stepIndex respeta los extremos', () => {
-    expect(stepIndex(0, 3, 1)).toBe(1);
-    expect(stepIndex(2, 3, 1)).toBeNull();
-    expect(stepIndex(0, 3, -1)).toBeNull();
-    expect(stepIndex(2, 3, -1)).toBe(1);
-  });
-});
-
-describe('aleatorio', () => {
-  const items = ['1', '2', '3', '4', '5'].map(id => ({ trackId: id, videoId: 'v' + id, title: id, artists: ['A'] }));
-  it('conserva todas las canciones y no modifica la original', () => {
-    const out = shuffleQueue(items, undefined, () => 0.3);
-    expect(out.map(i => i.trackId).sort()).toEqual(['1', '2', '3', '4', '5']);
-    expect(items.map(i => i.trackId)).toEqual(['1', '2', '3', '4', '5']);
-  });
-  it('deja primera la canción indicada', () => {
-    for (const r of [0, 0.5, 0.99]) expect(shuffleQueue(items, '4', () => r)[0].trackId).toBe('4');
-  });
-  it('realmente reordena', () => {
-    expect(shuffleQueue(items, undefined, () => 0).map(i => i.trackId)).not.toEqual(['1', '2', '3', '4', '5']);
-  });
-});
-</file>
-
 <file path="app.json">
 {
   "expo": {
@@ -2194,249 +3164,257 @@ describe('aleatorio', () => {
 }
 </file>
 
-<file path="src/db/repository.ts">
-import { Track, TrackCandidate, TrackVersion } from '../models/Track';
-import { MatchResult } from '../core/matching/scoreCandidate';
-import { Db } from './database';
-
-export type MatchStatus = 'auto' | 'manual' | 'pending' | 'none';
-export interface ScoredCandidate { candidate: TrackCandidate; result: MatchResult }
-export interface StoredCandidate extends TrackCandidate { score: number; decision: string; reasons: string[]; conflicts: string[]; warnings: string[] }
-
-const MAX_CANDIDATES = 5;
-const now = () => Date.now();
-export const newId = (): string =>
-  Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
-
-interface TrackRow {
-  id: string; spotify_id: string | null; title: string; artists: string; album: string | null;
-  duration_ms: number | null; isrc: string | null; version: string; musicbrainz_id: string | null;
+<file path="src/core/player/queue.ts">
+export interface QueueItem {
+  trackId: string;
+  videoId: string;
+  title: string;
+  artists: string[];
 }
-const toTrack = (r: TrackRow): Track => ({
-  id: r.id, title: r.title, artists: JSON.parse(r.artists) as string[],
-  album: r.album ?? undefined, durationMs: r.duration_ms ?? undefined, isrc: r.isrc ?? undefined,
-  version: r.version as TrackVersion,
-  externalIds: { spotify: r.spotify_id ?? undefined, musicBrainzRecording: r.musicbrainz_id ?? undefined },
+
+interface EntryLike {
+  track: { id: string; title: string; artists: string[] };
+  status: string | null;
+  videoId: string | null;
+}
+
+/** Cola de reproducción: solo canciones con vídeo resuelto (auto o manual), en el orden de la playlist. */
+export function buildQueue(entries: EntryLike[]): QueueItem[] {
+  return entries
+    .filter(e => (e.status === 'auto' || e.status === 'manual') && e.videoId)
+    .map(e => ({ trackId: e.track.id, videoId: e.videoId as string, title: e.track.title, artists: e.track.artists }));
+}
+
+/** Índice siguiente/anterior, o null si se sale de la cola. */
+export function stepIndex(index: number, length: number, dir: 1 | -1): number | null {
+  const n = index + dir;
+  return n >= 0 && n < length ? n : null;
+}
+
+export type RepeatMode = 'off' | 'all' | 'one';
+
+export const nextRepeat = (m: RepeatMode): RepeatMode => (m === 'off' ? 'all' : m === 'all' ? 'one' : 'off');
+
+/**
+ * Índice siguiente/anterior según el modo de repetir. Con 'all' la cola da la vuelta;
+ * con 'off' y 'one' (al pasar a mano) se sale por los extremos (null).
+ */
+export function nextIndex(index: number, length: number, dir: 1 | -1, repeat: RepeatMode): number | null {
+  const n = stepIndex(index, length, dir);
+  if (n !== null || repeat !== 'all' || length === 0) return n;
+  return dir === 1 ? 0 : length - 1;
+}
+
+/**
+ * Mezcla la cola (Fisher-Yates). Si se indica `firstTrackId`, esa canción queda
+ * la primera y el resto se mezcla. `random` es inyectable para los tests.
+ */
+export function shuffleQueue(items: QueueItem[], firstTrackId?: string, random: () => number = Math.random): QueueItem[] {
+  const first = firstTrackId ? items.find(i => i.trackId === firstTrackId) : undefined;
+  const rest = items.filter(i => i !== first);
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [rest[i], rest[j]] = [rest[j], rest[i]];
+  }
+  return first ? [first, ...rest] : rest;
+}
+</file>
+
+<file path="src/ui/ReviewScreen.tsx">
+import React, { useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Linking, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { SearchFn } from '../core/matching/matchTrack';
+import { Db } from '../db/database';
+import { listPendingReviews, markNone, PendingReview, resolveManual } from '../db/repository';
+import { Btn } from './kit';
+import { ManualSearch } from './ManualSearch';
+import { colors, radius, type } from './theme';
+
+const fmt = (ms?: number): string => {
+  if (!ms) return '—';
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+export function ReviewScreen({ db, search, onChanged }: { db: Db; search: SearchFn; onChanged?: () => void }) {
+  const [items, setItems] = useState<PendingReview[] | null>(null);
+  const [i, setI] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [manual, setManual] = useState(false);
+
+  const load = useCallback(async () => {
+    setItems(await listPendingReviews(db));
+    setI(0);
+  }, [db]);
+  useEffect(() => { load(); }, [load]);
+
+  const act = async (fn: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try { await fn(); await load(); onChanged?.(); } finally { setBusy(false); }
+  };
+
+  const cur = items && items.length > 0 ? items[i % items.length] : null;
+
+  return (
+    <ScrollView contentContainerStyle={s.container}>
+      <Text style={type.small}>Coincidencias dudosas</Text>
+      <Text style={type.h1}>Revisar</Text>
+
+      {items === null && <ActivityIndicator color={colors.accent} />}
+      {items && items.length === 0 && (
+        <View style={s.empty}><Text style={type.body}>No queda nada pendiente. Todo en orden.</Text></View>
+      )}
+
+      {cur && items && (
+        <>
+          <Text style={type.small}>{(i % items.length) + 1} de {items.length} pendientes</Text>
+
+          <View style={s.original}>
+            <Text style={s.originalLabel}>EN SPOTIFY</Text>
+            <Text style={s.originalTitle}>{cur.track.title}</Text>
+            <Text style={s.originalMeta}>
+              {cur.track.artists.join(', ')} · {fmt(cur.track.durationMs)}
+              {cur.track.version !== 'studio' ? ` · ${cur.track.version}` : ''}
+            </Text>
+          </View>
+
+          {cur.candidates.slice(0, 3).map(c => {
+            const notes = [...c.conflicts, ...c.warnings];
+            return (
+              <View key={c.externalId} style={s.cand}>
+                <View style={s.candHead}>
+                  <Text style={s.candLabel}>CANDIDATO</Text>
+                  <Text style={s.score}>{Math.round(c.score)} pts</Text>
+                </View>
+                <Text style={s.candTitle}>{c.title}</Text>
+                <Text style={type.body}>{c.artists.join(', ') || 'Artista desconocido'} · {fmt(c.durationMs)}</Text>
+                {c.reasons.length > 0 && <Text style={s.good}>{c.reasons.join(' · ')}</Text>}
+                {notes.length > 0 && <Text style={s.warn}>{notes.join(' · ')}</Text>}
+                <View style={s.row}>
+                  <Btn flex label="Elegir" disabled={busy} onPress={() => act(() => resolveManual(db, cur.track.id, c.externalId))} />
+                  <Btn flex tone="soft" icon="play" label="Escuchar" onPress={() => Linking.openURL(`https://music.youtube.com/watch?v=${c.externalId}`)} />
+                </View>
+              </View>
+            );
+          })}
+
+          <Btn tone="dark" icon="search" label="Buscar manualmente" disabled={busy} onPress={() => setManual(true)} />
+          <View style={s.row}>
+            <Btn flex tone="soft" label="Ninguno es correcto" disabled={busy} onPress={() => act(() => markNone(db, cur.track.id))} />
+            {items.length > 1 && <Btn flex tone="soft" label="Saltar" onPress={() => setI(n => n + 1)} />}
+          </View>
+        </>
+      )}
+
+      {manual && cur && (
+        <ManualSearch
+          db={db} track={cur.track} search={search}
+          onClose={() => setManual(false)}
+          onPicked={() => { setManual(false); load().then(() => onChanged?.()); }}
+        />
+      )}
+    </ScrollView>
+  );
+}
+
+const s = StyleSheet.create({
+  container: { padding: 24, gap: 14, paddingBottom: 32 },
+  empty: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 18, borderWidth: 1, borderColor: colors.line },
+  original: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 20, gap: 4 },
+  originalLabel: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  originalTitle: { color: colors.onDark, fontSize: 24, lineHeight: 29, fontWeight: '800', letterSpacing: -0.5 },
+  originalMeta: { color: colors.onDarkMuted, fontSize: 14 },
+  cand: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 16, gap: 6, borderWidth: 1, borderColor: colors.line },
+  candHead: { flexDirection: 'row', justifyContent: 'space-between' },
+  candLabel: { color: colors.faint, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  score: { color: colors.gold, fontSize: 12, fontWeight: '800' },
+  candTitle: { color: colors.text, fontSize: 17, fontWeight: '800', letterSpacing: -0.3 },
+  good: { color: colors.gold, fontSize: 12 },
+  warn: { color: colors.terracotta, fontSize: 12 },
+  row: { flexDirection: 'row', gap: 10, marginTop: 6 },
 });
+</file>
 
-/** Inserta la canción o actualiza la existente (clave: id de Spotify). Devuelve el id interno. */
-export async function upsertTrack(db: Db, track: Track): Promise<string> {
-  const spotify = track.externalIds.spotify ?? null;
-  if (spotify) {
-    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE spotify_id = ?', [spotify]);
-    if (existing) {
-      await db.runAsync(
-        'UPDATE tracks SET title=?, artists=?, album=?, duration_ms=?, isrc=?, version=? WHERE id=?',
-        [track.title, JSON.stringify(track.artists), track.album ?? null, track.durationMs ?? null,
-         track.isrc ?? null, track.version, existing.id]);
-      return existing.id;
-    }
-  }
-  await db.runAsync(
-    `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-    [track.id, spotify, track.title, JSON.stringify(track.artists), track.album ?? null,
-     track.durationMs ?? null, track.isrc ?? null, track.version,
-     track.externalIds.musicBrainzRecording ?? null, now()]);
-  return track.id;
+<file path="src/ui/YouTubePlayer.tsx">
+import React, { forwardRef, useImperativeHandle, useRef } from 'react';
+import { View } from 'react-native';
+import YoutubePlayer, { YoutubeIframeRef } from 'react-native-youtube-iframe';
+
+export interface PlayerProps {
+  videoId: string;
+  playing: boolean;
+  onEnded: () => void;
+  onError: (reason: string) => void;
+  onPlayingChange: (playing: boolean) => void;
+  /**
+   * iOS exige un toque del usuario DENTRO del reproductor para la primera reproducción.
+   * Con `catchTap` el reproductor (invisible) se coloca encima de su anfitrión (el botón de
+   * play del mini-reproductor, de `hostSize` px) para que ese toque caiga en él. Su tamaño y
+   * posición NO cambian nunca (cambiarlos hacía que iOS pausara la reproducción); solo se
+   * activa/desactiva que reciba toques. Debe renderizarse dentro de una vista con `position: relative`.
+   */
+  catchTap?: boolean;
+  hostSize?: number;
+  /** Mensajes de diagnóstico (estados del reproductor y errores). */
+  onLog?: (message: string) => void;
 }
 
-export async function getTrack(db: Db, id: string): Promise<Track | null> {
-  const row = await db.getFirstAsync<TrackRow>('SELECT * FROM tracks WHERE id = ?', [id]);
-  return row ? toTrack(row) : null;
+/** Control del motor desde fuera (progreso y saltos). */
+export interface PlayerHandle {
+  getCurrentTime: () => Promise<number>;
+  getDuration: () => Promise<number>;
+  seekTo: (seconds: number) => void;
 }
+
+const W = 240;
+const H = 135;
 
 /**
- * Guarda una playlist y el orden de sus canciones. Reimportar la misma playlist
- * (mismo spotifyId) la actualiza en vez de duplicarla.
+ * ÚNICO archivo que conoce el motor de reproducción (iframe oficial de YouTube).
+ * El vídeo nunca se ve: va recortado al tamaño del botón de play y a opacidad casi nula.
+ * Para cambiar a otra vía basta con reescribir este componente con las mismas props y handle.
  */
-export async function savePlaylist(
-  db: Db,
-  playlist: { name: string; spotifyId?: string; sourceUrl?: string },
-  trackIds: string[],
-): Promise<string> {
-  let id: string | undefined;
-  if (playlist.spotifyId) {
-    id = (await db.getFirstAsync<{ id: string }>('SELECT id FROM playlists WHERE spotify_id = ?', [playlist.spotifyId]))?.id;
-  }
-  await db.execAsync('BEGIN');
-  try {
-    if (id) {
-      await db.runAsync('UPDATE playlists SET name=?, source_url=? WHERE id=?', [playlist.name, playlist.sourceUrl ?? null, id]);
-      await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [id]);
-    } else {
-      id = newId();
-      await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,?,?,?,?)',
-        [id, playlist.spotifyId ?? null, playlist.name, playlist.sourceUrl ?? null, now()]);
-    }
-    for (let i = 0; i < trackIds.length; i++) {
-      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, trackIds[i]]);
-    }
-    await db.execAsync('COMMIT');
-  } catch (error) {
-    await db.execAsync('ROLLBACK');
-    throw error;
-  }
-  return id;
-}
+export const YouTubePlayer = forwardRef<PlayerHandle, PlayerProps>(function YouTubePlayer(
+  { videoId, playing, onEnded, onError, onPlayingChange, catchTap = false, hostSize = 38, onLog }, ref,
+) {
+  const inner = useRef<YoutubeIframeRef>(null);
+  useImperativeHandle(ref, () => ({
+    getCurrentTime: async () => (await inner.current?.getCurrentTime()) ?? 0,
+    getDuration: async () => (await inner.current?.getDuration()) ?? 0,
+    seekTo: (seconds: number) => { inner.current?.seekTo(seconds, true); },
+  }), []);
 
-export interface PlaylistEntry { position: number; track: Track; status: MatchStatus | null; videoId: string | null }
-
-export async function getPlaylistEntries(db: Db, playlistId: string): Promise<PlaylistEntry[]> {
-  const rows = await db.getAllAsync<TrackRow & { position: number; m_status: string | null; m_video: string | null }>(
-    `SELECT t.*, pt.position, m.status AS m_status, m.video_id AS m_video
-     FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
-     LEFT JOIN matches m ON m.track_id = t.id
-     WHERE pt.playlist_id = ? ORDER BY pt.position`, [playlistId]);
-  return rows.map(r => ({ position: r.position, track: toTrack(r), status: r.m_status as MatchStatus | null, videoId: r.m_video }));
-}
-
-/** Caché: vídeo ya resuelto (auto o manual) para una canción de Spotify. */
-export async function getCachedVideoId(db: Db, spotifyId: string): Promise<string | null> {
-  const row = await db.getFirstAsync<{ video_id: string }>(
-    `SELECT m.video_id FROM matches m JOIN tracks t ON t.id = m.track_id
-     WHERE t.spotify_id = ? AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL`, [spotifyId]);
-  return row?.video_id ?? null;
-}
-
-export async function getMatchStatus(db: Db, trackId: string): Promise<{ status: MatchStatus; videoId: string | null } | null> {
-  const row = await db.getFirstAsync<{ status: string; video_id: string | null }>(
-    'SELECT status, video_id FROM matches WHERE track_id = ?', [trackId]);
-  return row ? { status: row.status as MatchStatus, videoId: row.video_id } : null;
-}
-
-async function setMatch(db: Db, trackId: string, status: MatchStatus, videoId: string | null, score: number | null) {
-  await db.runAsync(
-    `INSERT INTO matches (track_id, video_id, status, score, updated_at) VALUES (?,?,?,?,?)
-     ON CONFLICT(track_id) DO UPDATE SET video_id=excluded.video_id, status=excluded.status,
-       score=excluded.score, updated_at=excluded.updated_at`,
-    [trackId, videoId, status, score, now()]);
-}
-
-/**
- * Registra el resultado del matching de una canción. Una decisión manual
- * previa del usuario nunca se sobrescribe.
- */
-export async function recordMatching(db: Db, trackId: string, scored: ScoredCandidate[]): Promise<MatchStatus> {
-  const current = await getMatchStatus(db, trackId);
-  if (current?.status === 'manual') return 'manual';
-
-  const usable = scored
-    .filter(s => s.result.decision !== 'reject')
-    .sort((a, b) => b.result.score - a.result.score)
-    .slice(0, MAX_CANDIDATES);
-
-  await db.runAsync('DELETE FROM candidates WHERE track_id = ?', [trackId]);
-  for (const { candidate: c, result: r } of usable) {
-    await db.runAsync(
-      `INSERT INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
-         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [trackId, c.provider, c.externalId, c.title, JSON.stringify(c.artists), c.durationMs ?? null, c.version,
-       r.score, r.decision, JSON.stringify(r.reasons), JSON.stringify(r.conflicts), JSON.stringify(r.warnings)]);
-  }
-
-  const best = usable[0];
-  if (best && best.result.decision === 'auto' && best.candidate.provider === 'youtube') {
-    await setMatch(db, trackId, 'auto', best.candidate.externalId, best.result.score);
-    return 'auto';
-  }
-  if (usable.length > 0) {
-    await setMatch(db, trackId, 'pending', null, best.result.score);
-    return 'pending';
-  }
-  await setMatch(db, trackId, 'none', null, null);
-  return 'none';
-}
-
-/** El usuario elige un vídeo concreto para una canción. */
-export async function resolveManual(db: Db, trackId: string, videoId: string): Promise<void> {
-  await setMatch(db, trackId, 'manual', videoId, null);
-}
-
-export interface PendingReview { track: Track; candidates: StoredCandidate[] }
-
-export async function listPendingReviews(db: Db): Promise<PendingReview[]> {
-  const rows = await db.getAllAsync<TrackRow>(
-    `SELECT t.* FROM tracks t JOIN matches m ON m.track_id = t.id
-     WHERE m.status = 'pending' ORDER BY t.created_at, t.title`);
-  const out: PendingReview[] = [];
-  for (const row of rows) {
-    const cands = await db.getAllAsync<{
-      provider: string; external_id: string; title: string; artists: string; duration_ms: number | null;
-      version: string; score: number; decision: string; reasons: string; conflicts: string; warnings: string;
-    }>('SELECT * FROM candidates WHERE track_id = ? ORDER BY score DESC', [row.id]);
-    out.push({
-      track: toTrack(row),
-      candidates: cands.map(c => ({
-        provider: c.provider as TrackCandidate['provider'], externalId: c.external_id, title: c.title,
-        artists: JSON.parse(c.artists), durationMs: c.duration_ms ?? undefined, version: c.version as TrackVersion,
-        score: c.score, decision: c.decision, reasons: JSON.parse(c.reasons),
-        conflicts: JSON.parse(c.conflicts), warnings: JSON.parse(c.warnings),
-      })),
-    });
-  }
-  return out;
-}
-
-export async function countByStatus(db: Db): Promise<Record<string, number>> {
-  const rows = await db.getAllAsync<{ status: string; n: number }>('SELECT status, COUNT(*) AS n FROM matches GROUP BY status');
-  const out: Record<string, number> = {};
-  for (const r of rows) out[r.status] = r.n;
-  return out;
-}
-
-export interface ChosenVideo { title: string; artists: string[]; durationMs?: number }
-
-/** Vídeo elegido (auto o manual) de cada canción de una playlist, indexado por id de canción. */
-export async function getChosenVideos(db: Db, playlistId: string): Promise<Record<string, ChosenVideo>> {
-  const rows = await db.getAllAsync<{ track_id: string; title: string; artists: string; duration_ms: number | null }>(
-    `SELECT pt.track_id, c.title, c.artists, c.duration_ms
-     FROM playlist_tracks pt
-     JOIN matches m ON m.track_id = pt.track_id AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL
-     JOIN candidates c ON c.track_id = m.track_id AND c.provider = 'youtube' AND c.external_id = m.video_id
-     WHERE pt.playlist_id = ?`, [playlistId]);
-  const out: Record<string, ChosenVideo> = {};
-  for (const r of rows) {
-    out[r.track_id] = { title: r.title, artists: JSON.parse(r.artists) as string[], durationMs: r.duration_ms ?? undefined };
-  }
-  return out;
-}
-
-/** El usuario descarta todos los candidatos de una canción (queda 'none'; una nueva búsqueda puede reintentarla). */
-export async function markNone(db: Db, trackId: string): Promise<void> {
-  await setMatch(db, trackId, 'none', null, null);
-}
-
-export interface PlaylistInfo { id: string; name: string; total: number; resolved: number; pending: number }
-
-/** Playlists guardadas, las más recientes primero, con su progreso de matching. */
-export async function listPlaylists(db: Db): Promise<PlaylistInfo[]> {
-  return db.getAllAsync<PlaylistInfo>(
-    `SELECT p.id AS id, p.name AS name,
-            COUNT(pt.track_id) AS total,
-            COALESCE(SUM(CASE WHEN m.status IN ('auto','manual') THEN 1 ELSE 0 END), 0) AS resolved,
-            COALESCE(SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending
-     FROM playlists p
-     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
-     LEFT JOIN matches m ON m.track_id = pt.track_id
-     GROUP BY p.id ORDER BY p.created_at DESC, p.name`);
-}
-
-/**
- * Borra una playlist y las canciones que ya no están en ninguna otra
- * (con sus coincidencias y candidatos). Las canciones compartidas se conservan.
- */
-export async function deletePlaylist(db: Db, playlistId: string): Promise<void> {
-  await db.execAsync('BEGIN');
-  try {
-    await db.runAsync('DELETE FROM playlists WHERE id = ?', [playlistId]);
-    await db.execAsync('DELETE FROM tracks WHERE id NOT IN (SELECT track_id FROM playlist_tracks)');
-    await db.execAsync('COMMIT');
-  } catch (error) {
-    await db.execAsync('ROLLBACK');
-    throw error;
-  }
-}
+  return (
+    <View
+      pointerEvents={catchTap ? 'auto' : 'none'}
+      style={{
+        position: 'absolute', left: 0, top: 0, width: hostSize, height: hostSize, borderRadius: hostSize / 2,
+        overflow: 'hidden', opacity: 0.05, zIndex: 10,
+      }}
+    >
+      {/* El centro del reproductor (donde YouTube pone su botón de play) queda bajo el dedo. */}
+      <View style={{ position: 'absolute', width: W, height: H, left: -(W - hostSize) / 2, top: -(H - hostSize) / 2 }}>
+        <YoutubePlayer
+          ref={inner}
+          width={W}
+          height={H}
+          videoId={videoId}
+          play={playing}
+          webViewProps={{ allowsInlineMediaPlayback: true, mediaPlaybackRequiresUserAction: false }}
+          onReady={() => onLog?.('listo')}
+          onChangeState={(state: string) => {
+            onLog?.(`estado: ${state}`);
+            if (state === 'ended') onEnded();
+            else if (state === 'playing') onPlayingChange(true);
+            else if (state === 'paused') onPlayingChange(false);
+          }}
+          onError={(reason: string) => { onLog?.(`error: ${reason}`); onError(reason); }}
+        />
+      </View>
+    </View>
+  );
+});
 </file>
 
 <file path="tests/db.test.ts">
@@ -2583,6 +3561,409 @@ describe('biblioteca', () => {
 });
 </file>
 
+<file path="tests/queue.test.ts">
+import { describe, expect, it } from 'vitest';
+import { buildQueue, shuffleQueue, stepIndex } from '../src/core/player/queue';
+
+const e = (id: string, status: string | null, videoId: string | null) => ({
+  track: { id, title: 'T' + id, artists: ['A'] }, status, videoId,
+});
+
+describe('cola de reproducción', () => {
+  it('solo incluye canciones resueltas, en orden', () => {
+    const q = buildQueue([e('1', 'auto', 'v1'), e('2', 'pending', null), e('3', 'none', null), e('4', 'manual', 'v4'), e('5', 'auto', null)]);
+    expect(q.map(i => i.videoId)).toEqual(['v1', 'v4']);
+    expect(q[1]).toMatchObject({ trackId: '4', title: 'T4', artists: ['A'] });
+  });
+  it('stepIndex respeta los extremos', () => {
+    expect(stepIndex(0, 3, 1)).toBe(1);
+    expect(stepIndex(2, 3, 1)).toBeNull();
+    expect(stepIndex(0, 3, -1)).toBeNull();
+    expect(stepIndex(2, 3, -1)).toBe(1);
+  });
+});
+
+describe('aleatorio', () => {
+  const items = ['1', '2', '3', '4', '5'].map(id => ({ trackId: id, videoId: 'v' + id, title: id, artists: ['A'] }));
+  it('conserva todas las canciones y no modifica la original', () => {
+    const out = shuffleQueue(items, undefined, () => 0.3);
+    expect(out.map(i => i.trackId).sort()).toEqual(['1', '2', '3', '4', '5']);
+    expect(items.map(i => i.trackId)).toEqual(['1', '2', '3', '4', '5']);
+  });
+  it('deja primera la canción indicada', () => {
+    for (const r of [0, 0.5, 0.99]) expect(shuffleQueue(items, '4', () => r)[0].trackId).toBe('4');
+  });
+  it('realmente reordena', () => {
+    expect(shuffleQueue(items, undefined, () => 0).map(i => i.trackId)).not.toEqual(['1', '2', '3', '4', '5']);
+  });
+});
+
+import { nextIndex, nextRepeat } from '../src/core/player/queue';
+import { clamp01, formatClock, thumbnailUrl } from '../src/core/player/format';
+
+describe('repetir', () => {
+  it('cicla off → all → one → off', () => {
+    expect(nextRepeat('off')).toBe('all');
+    expect(nextRepeat('all')).toBe('one');
+    expect(nextRepeat('one')).toBe('off');
+  });
+  it('sin repetir (o con repetir una) los extremos devuelven null', () => {
+    for (const m of ['off', 'one'] as const) {
+      expect(nextIndex(2, 3, 1, m)).toBeNull();
+      expect(nextIndex(0, 3, -1, m)).toBeNull();
+      expect(nextIndex(0, 3, 1, m)).toBe(1);
+    }
+  });
+  it('repetir todo da la vuelta en ambos sentidos', () => {
+    expect(nextIndex(2, 3, 1, 'all')).toBe(0);
+    expect(nextIndex(0, 3, -1, 'all')).toBe(2);
+    expect(nextIndex(0, 1, 1, 'all')).toBe(0);
+    expect(nextIndex(0, 0, 1, 'all')).toBeNull();
+  });
+});
+
+describe('formato del reproductor', () => {
+  it('formatClock', () => {
+    expect(formatClock(83.9)).toBe('1:23');
+    expect(formatClock(5)).toBe('0:05');
+    expect(formatClock(3600)).toBe('60:00');
+    expect(formatClock(-3)).toBe('0:00');
+    expect(formatClock(NaN)).toBe('0:00');
+  });
+  it('clamp01 y thumbnailUrl', () => {
+    expect(clamp01(-1)).toBe(0); expect(clamp01(2)).toBe(1); expect(clamp01(0.4)).toBe(0.4); expect(clamp01(NaN)).toBe(0);
+    expect(thumbnailUrl('abc')).toBe('https://i.ytimg.com/vi/abc/hqdefault.jpg');
+  });
+});
+</file>
+
+<file path="src/db/repository.ts">
+import { Track, TrackCandidate, TrackVersion } from '../models/Track';
+import { MatchResult } from '../core/matching/scoreCandidate';
+import { Db } from './database';
+
+export type MatchStatus = 'auto' | 'manual' | 'pending' | 'none';
+export interface ScoredCandidate { candidate: TrackCandidate; result: MatchResult }
+export interface StoredCandidate extends TrackCandidate { score: number; decision: string; reasons: string[]; conflicts: string[]; warnings: string[] }
+
+const MAX_CANDIDATES = 5;
+const now = () => Date.now();
+export const newId = (): string =>
+  Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+
+interface TrackRow {
+  id: string; spotify_id: string | null; title: string; artists: string; album: string | null;
+  duration_ms: number | null; isrc: string | null; version: string; musicbrainz_id: string | null;
+  youtube_id: string | null;
+}
+const toTrack = (r: TrackRow): Track => ({
+  id: r.id, title: r.title, artists: JSON.parse(r.artists) as string[],
+  album: r.album ?? undefined, durationMs: r.duration_ms ?? undefined, isrc: r.isrc ?? undefined,
+  version: r.version as TrackVersion,
+  externalIds: {
+    spotify: r.spotify_id ?? undefined, youtubeVideo: r.youtube_id ?? undefined,
+    musicBrainzRecording: r.musicbrainz_id ?? undefined,
+  },
+});
+
+/** Inserta la canción o actualiza la existente (clave: id de Spotify). Devuelve el id interno. */
+export async function upsertTrack(db: Db, track: Track): Promise<string> {
+  const spotify = track.externalIds.spotify ?? null;
+  if (spotify) {
+    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE spotify_id = ?', [spotify]);
+    if (existing) {
+      await db.runAsync(
+        'UPDATE tracks SET title=?, artists=?, album=?, duration_ms=?, isrc=?, version=? WHERE id=?',
+        [track.title, JSON.stringify(track.artists), track.album ?? null, track.durationMs ?? null,
+         track.isrc ?? null, track.version, existing.id]);
+      return existing.id;
+    }
+  }
+  await db.runAsync(
+    `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [track.id, spotify, track.title, JSON.stringify(track.artists), track.album ?? null,
+     track.durationMs ?? null, track.isrc ?? null, track.version,
+     track.externalIds.musicBrainzRecording ?? null, now()]);
+  return track.id;
+}
+
+export async function getTrack(db: Db, id: string): Promise<Track | null> {
+  const row = await db.getFirstAsync<TrackRow>('SELECT * FROM tracks WHERE id = ?', [id]);
+  return row ? toTrack(row) : null;
+}
+
+/**
+ * Guarda una playlist y el orden de sus canciones. Reimportar la misma playlist
+ * (mismo spotifyId) la actualiza en vez de duplicarla.
+ */
+export async function savePlaylist(
+  db: Db,
+  playlist: { name: string; spotifyId?: string; sourceUrl?: string },
+  trackIds: string[],
+): Promise<string> {
+  let id: string | undefined;
+  if (playlist.spotifyId) {
+    id = (await db.getFirstAsync<{ id: string }>('SELECT id FROM playlists WHERE spotify_id = ?', [playlist.spotifyId]))?.id;
+  }
+  await db.execAsync('BEGIN');
+  try {
+    if (id) {
+      await db.runAsync('UPDATE playlists SET name=?, source_url=? WHERE id=?', [playlist.name, playlist.sourceUrl ?? null, id]);
+      await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [id]);
+    } else {
+      id = newId();
+      await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,?,?,?,?)',
+        [id, playlist.spotifyId ?? null, playlist.name, playlist.sourceUrl ?? null, now()]);
+    }
+    for (let i = 0; i < trackIds.length; i++) {
+      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, trackIds[i]]);
+    }
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+  return id;
+}
+
+export interface PlaylistEntry { position: number; track: Track; status: MatchStatus | null; videoId: string | null }
+
+export async function getPlaylistEntries(db: Db, playlistId: string): Promise<PlaylistEntry[]> {
+  const rows = await db.getAllAsync<TrackRow & { position: number; m_status: string | null; m_video: string | null }>(
+    `SELECT t.*, pt.position, m.status AS m_status, m.video_id AS m_video
+     FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+     LEFT JOIN matches m ON m.track_id = t.id
+     WHERE pt.playlist_id = ? ORDER BY pt.position`, [playlistId]);
+  return rows.map(r => ({ position: r.position, track: toTrack(r), status: r.m_status as MatchStatus | null, videoId: r.m_video }));
+}
+
+/** Caché: vídeo ya resuelto (auto o manual) para una canción de Spotify. */
+export async function getCachedVideoId(db: Db, spotifyId: string): Promise<string | null> {
+  const row = await db.getFirstAsync<{ video_id: string }>(
+    `SELECT m.video_id FROM matches m JOIN tracks t ON t.id = m.track_id
+     WHERE t.spotify_id = ? AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL`, [spotifyId]);
+  return row?.video_id ?? null;
+}
+
+export async function getMatchStatus(db: Db, trackId: string): Promise<{ status: MatchStatus; videoId: string | null } | null> {
+  const row = await db.getFirstAsync<{ status: string; video_id: string | null }>(
+    'SELECT status, video_id FROM matches WHERE track_id = ?', [trackId]);
+  return row ? { status: row.status as MatchStatus, videoId: row.video_id } : null;
+}
+
+async function setMatch(db: Db, trackId: string, status: MatchStatus, videoId: string | null, score: number | null) {
+  await db.runAsync(
+    `INSERT INTO matches (track_id, video_id, status, score, updated_at) VALUES (?,?,?,?,?)
+     ON CONFLICT(track_id) DO UPDATE SET video_id=excluded.video_id, status=excluded.status,
+       score=excluded.score, updated_at=excluded.updated_at`,
+    [trackId, videoId, status, score, now()]);
+}
+
+/**
+ * Registra el resultado del matching de una canción. Una decisión manual
+ * previa del usuario nunca se sobrescribe.
+ */
+export async function recordMatching(db: Db, trackId: string, scored: ScoredCandidate[]): Promise<MatchStatus> {
+  const current = await getMatchStatus(db, trackId);
+  if (current?.status === 'manual') return 'manual';
+
+  const usable = scored
+    .filter(s => s.result.decision !== 'reject')
+    .sort((a, b) => b.result.score - a.result.score)
+    .slice(0, MAX_CANDIDATES);
+
+  await db.runAsync('DELETE FROM candidates WHERE track_id = ?', [trackId]);
+  for (const { candidate: c, result: r } of usable) {
+    await db.runAsync(
+      `INSERT INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, c.provider, c.externalId, c.title, JSON.stringify(c.artists), c.durationMs ?? null, c.version,
+       r.score, r.decision, JSON.stringify(r.reasons), JSON.stringify(r.conflicts), JSON.stringify(r.warnings)]);
+  }
+
+  const best = usable[0];
+  if (best && best.result.decision === 'auto' && best.candidate.provider === 'youtube') {
+    await setMatch(db, trackId, 'auto', best.candidate.externalId, best.result.score);
+    return 'auto';
+  }
+  if (usable.length > 0) {
+    await setMatch(db, trackId, 'pending', null, best.result.score);
+    return 'pending';
+  }
+  await setMatch(db, trackId, 'none', null, null);
+  return 'none';
+}
+
+/** El usuario elige un vídeo concreto para una canción. */
+export async function resolveManual(db: Db, trackId: string, videoId: string): Promise<void> {
+  await setMatch(db, trackId, 'manual', videoId, null);
+}
+
+/**
+ * El usuario elige un vídeo salido de una búsqueda manual (puede no estar entre
+ * los candidatos guardados). Se guarda como candidato y como coincidencia manual,
+ * de modo que la playlist pueda mostrar y reproducir el vídeo elegido.
+ */
+export async function resolveManualFromSearch(
+  db: Db, trackId: string, candidate: TrackCandidate, result: MatchResult,
+): Promise<void> {
+  await db.execAsync('BEGIN');
+  try {
+    await db.runAsync(
+      `INSERT OR REPLACE INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, candidate.provider, candidate.externalId, candidate.title, JSON.stringify(candidate.artists),
+       candidate.durationMs ?? null, candidate.version, result.score, result.decision,
+       JSON.stringify(result.reasons), JSON.stringify(result.conflicts), JSON.stringify(result.warnings)]);
+    await setMatch(db, trackId, 'manual', candidate.externalId, null);
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}
+
+export interface PendingReview { track: Track; candidates: StoredCandidate[] }
+
+export async function listPendingReviews(db: Db): Promise<PendingReview[]> {
+  const rows = await db.getAllAsync<TrackRow>(
+    `SELECT t.* FROM tracks t JOIN matches m ON m.track_id = t.id
+     WHERE m.status = 'pending' ORDER BY t.created_at, t.title`);
+  const out: PendingReview[] = [];
+  for (const row of rows) {
+    const cands = await db.getAllAsync<{
+      provider: string; external_id: string; title: string; artists: string; duration_ms: number | null;
+      version: string; score: number; decision: string; reasons: string; conflicts: string; warnings: string;
+    }>('SELECT * FROM candidates WHERE track_id = ? ORDER BY score DESC', [row.id]);
+    out.push({
+      track: toTrack(row),
+      candidates: cands.map(c => ({
+        provider: c.provider as TrackCandidate['provider'], externalId: c.external_id, title: c.title,
+        artists: JSON.parse(c.artists), durationMs: c.duration_ms ?? undefined, version: c.version as TrackVersion,
+        score: c.score, decision: c.decision, reasons: JSON.parse(c.reasons),
+        conflicts: JSON.parse(c.conflicts), warnings: JSON.parse(c.warnings),
+      })),
+    });
+  }
+  return out;
+}
+
+export async function countByStatus(db: Db): Promise<Record<string, number>> {
+  const rows = await db.getAllAsync<{ status: string; n: number }>('SELECT status, COUNT(*) AS n FROM matches GROUP BY status');
+  const out: Record<string, number> = {};
+  for (const r of rows) out[r.status] = r.n;
+  return out;
+}
+
+export interface ChosenVideo { title: string; artists: string[]; durationMs?: number }
+
+/** Vídeo elegido (auto o manual) de cada canción de una playlist, indexado por id de canción. */
+export async function getChosenVideos(db: Db, playlistId: string): Promise<Record<string, ChosenVideo>> {
+  const rows = await db.getAllAsync<{ track_id: string; title: string; artists: string; duration_ms: number | null }>(
+    `SELECT pt.track_id, c.title, c.artists, c.duration_ms
+     FROM playlist_tracks pt
+     JOIN matches m ON m.track_id = pt.track_id AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL
+     JOIN candidates c ON c.track_id = m.track_id AND c.provider = 'youtube' AND c.external_id = m.video_id
+     WHERE pt.playlist_id = ?`, [playlistId]);
+  const out: Record<string, ChosenVideo> = {};
+  for (const r of rows) {
+    out[r.track_id] = { title: r.title, artists: JSON.parse(r.artists) as string[], durationMs: r.duration_ms ?? undefined };
+  }
+  return out;
+}
+
+/** El usuario descarta todos los candidatos de una canción (queda 'none'; una nueva búsqueda puede reintentarla). */
+export async function markNone(db: Db, trackId: string): Promise<void> {
+  await setMatch(db, trackId, 'none', null, null);
+}
+
+export interface PlaylistInfo { id: string; name: string; total: number; resolved: number; pending: number }
+
+/** Playlists guardadas, las más recientes primero, con su progreso de matching. */
+export async function listPlaylists(db: Db): Promise<PlaylistInfo[]> {
+  return db.getAllAsync<PlaylistInfo>(
+    `SELECT p.id AS id, p.name AS name,
+            COUNT(pt.track_id) AS total,
+            COALESCE(SUM(CASE WHEN m.status IN ('auto','manual') THEN 1 ELSE 0 END), 0) AS resolved,
+            COALESCE(SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending
+     FROM playlists p
+     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+     LEFT JOIN matches m ON m.track_id = pt.track_id
+     GROUP BY p.id ORDER BY p.created_at DESC, p.name`);
+}
+
+/**
+ * Borra una playlist y las canciones que ya no están en ninguna otra
+ * (con sus coincidencias y candidatos). Las canciones compartidas se conservan.
+ */
+export async function deletePlaylist(db: Db, playlistId: string): Promise<void> {
+  await db.execAsync('BEGIN');
+  try {
+    await db.runAsync('DELETE FROM playlists WHERE id = ?', [playlistId]);
+    await db.execAsync('DELETE FROM tracks WHERE id NOT IN (SELECT track_id FROM playlist_tracks)');
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}
+
+/** Crea una playlist propia (sin origen en Spotify). Devuelve su id. */
+export async function createPlaylist(db: Db, name: string): Promise<string> {
+  const clean = name.trim();
+  if (!clean) throw new Error('El nombre de la playlist no puede estar vacío');
+  const id = newId();
+  await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,NULL,?,NULL,?)',
+    [id, clean, now()]);
+  return id;
+}
+
+export interface YoutubeTrackInput {
+  videoId: string; title: string; artists: string[]; album?: string; durationMs?: number; version: TrackVersion;
+}
+
+/**
+ * Añade al final de una playlist una canción encontrada en la búsqueda.
+ * La canción se identifica por su vídeo (no se duplica entre playlists) y queda
+ * con el vídeo ya elegido (coincidencia manual). Si ya estaba en esa playlist no se repite.
+ */
+export async function addYoutubeTrackToPlaylist(
+  db: Db, playlistId: string, t: YoutubeTrackInput,
+): Promise<{ added: boolean; trackId: string }> {
+  await db.execAsync('BEGIN');
+  try {
+    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE youtube_id = ?', [t.videoId]);
+    const trackId = existing?.id ?? newId();
+    if (!existing) {
+      await db.runAsync(
+        `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, youtube_id, created_at)
+         VALUES (?,NULL,?,?,?,?,NULL,?,NULL,?,?)`,
+        [trackId, t.title, JSON.stringify(t.artists), t.album ?? null, t.durationMs ?? null, t.version, t.videoId, now()]);
+    }
+    const dup = await db.getFirstAsync<{ track_id: string }>(
+      'SELECT track_id FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [playlistId, trackId]);
+    if (dup) { await db.execAsync('COMMIT'); return { added: false, trackId }; }
+
+    const next = await db.getFirstAsync<{ n: number }>(
+      'SELECT COALESCE(MAX(position), -1) + 1 AS n FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+    await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)',
+      [playlistId, next?.n ?? 0, trackId]);
+    await db.runAsync(
+      `INSERT OR REPLACE INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, 'youtube', t.videoId, t.title, JSON.stringify(t.artists), t.durationMs ?? null, t.version,
+       100, 'auto', JSON.stringify(['elegida desde la búsqueda']), '[]', '[]']);
+    await setMatch(db, trackId, 'manual', t.videoId, null);
+    await db.execAsync('COMMIT');
+    return { added: true, trackId };
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}
+</file>
+
 <file path="package.json">
 {
   "name": "music-project",
@@ -2624,7 +4005,8 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDim
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
 import { SearchFn } from './src/core/matching/matchTrack';
-import { buildQueue, QueueItem, shuffleQueue, stepIndex } from './src/core/player/queue';
+import { Track } from './src/models/Track';
+import { buildQueue, nextIndex, nextRepeat, QueueItem, RepeatMode, shuffleQueue } from './src/core/player/queue';
 import { Db } from './src/db/database';
 import { makeQueueDeps } from './src/db/matchingAdapter';
 import { openDb } from './src/db/openDb';
@@ -2633,10 +4015,15 @@ import {
 } from './src/db/repository';
 import { ImportError } from './src/importers/errors';
 import { importSpotifyPlaylist } from './src/importers/spotify/importPlaylist';
-import { searchYtMusic } from './src/providers/youtubeMusic/search';
+import { searchYtMusic, YtResult } from './src/providers/youtubeMusic/search';
 import { PlaylistCard, TrackRow } from './src/ui/cards';
 import { Btn, Chip, Disc, Icon, IconBtn } from './src/ui/kit';
-import { PlayerDock } from './src/ui/PlayerDock';
+import { ManualSearch } from './src/ui/ManualSearch';
+import { SearchScreen } from './src/ui/SearchScreen';
+import { MiniPlayer } from './src/ui/MiniPlayer';
+import { NowPlaying } from './src/ui/NowPlaying';
+import { usePlayerProgress } from './src/ui/usePlayerProgress';
+import { PlayerHandle, YouTubePlayer } from './src/ui/YouTubePlayer';
 import { ReviewScreen } from './src/ui/ReviewScreen';
 import { Tab, TabBar } from './src/ui/TabBar';
 import { colors, fonts, radius, type } from './src/ui/theme';
@@ -2672,6 +4059,15 @@ export default function App() {
   const [nowIdx, setNowIdx] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [shuffle, setShuffle] = useState(false);
+  const [repeat, setRepeat] = useState<RepeatMode>('off');
+  const [expanded, setExpanded] = useState(false);
+  const [unlocked, setUnlocked] = useState(false);
+  const [engineLog, setEngineLog] = useState<string[]>([]);
+  const log = useCallback((m: string) => setEngineLog(l => [...l.slice(-11), `${new Date().toLocaleTimeString()} ${m}`]), []);
+  const [awaitingTap, setAwaitingTap] = useState(false);
+  const [source, setSource] = useState('Playlist');
+  const engine = useRef<PlayerHandle>(null);
+  const [manualFor, setManualFor] = useState<Track | null>(null);
   const [debugOut, setDebugOut] = useState<string | null>(null);
   const signal = useRef({ aborted: false });
 
@@ -2782,16 +4178,30 @@ export default function App() {
     const b = buildQueue(entries);
     if (b.length === 0) return;
     const shuf = forceShuffle ?? shuffle;
+    setSource(current?.name ?? 'Playlist');
     setShuffle(shuf); setBase(b);
     if (shuf) { setQueue(shuffleQueue(b, trackId)); setNowIdx(0); }
     else { setQueue(b); setNowIdx(trackId ? Math.max(0, b.findIndex(i => i.trackId === trackId)) : 0); }
     setPlaying(true);
   };
+  const restart = () => {
+    engine.current?.seekTo(0);
+    setPlaying(false);
+    setTimeout(() => setPlaying(true), 60);
+  };
   const step = (dir: 1 | -1) => {
     if (nowIdx === null) return;
-    const n = stepIndex(nowIdx, queue.length, dir);
-    if (n === null) { if (dir === 1) { setNowIdx(null); setPlaying(false); } return; }
+    const n = nextIndex(nowIdx, queue.length, dir, repeat);
+    if (n === null) { if (dir === 1) { setNowIdx(null); setPlaying(false); setExpanded(false); } return; }
+    if (n === nowIdx) { restart(); return; }
     setNowIdx(n); setPlaying(true);
+  };
+  const onEnded = () => { if (repeat === 'one') restart(); else step(1); };
+  /** Como en las apps de streaming: pasados 3 s, "anterior" vuelve al inicio de la canción. */
+  const onPrev = async () => {
+    const t = await engine.current?.getCurrentTime().catch(() => 0);
+    if ((t ?? 0) > 3) { engine.current?.seekTo(0); return; }
+    step(-1);
   };
   const toggleShuffle = () => {
     if (nowIdx === null) { setShuffle(v => !v); return; }
@@ -2800,13 +4210,30 @@ export default function App() {
     else { setQueue(base); setNowIdx(Math.max(0, base.findIndex(i => i.trackId === cur.trackId))); }
     setShuffle(!shuffle);
   };
+  const playSearchResult = (r: YtResult) => {
+    const item: QueueItem = { trackId: `yt:${r.videoId}`, videoId: r.videoId, title: r.title, artists: r.artists };
+    setSource('Búsqueda'); setShuffle(false); setBase([item]); setQueue([item]); setNowIdx(0); setPlaying(true);
+  };
   const onPlayerError = () => {
     const cur = nowIdx !== null ? queue[nowIdx] : null;
     setError(`No se pudo reproducir "${cur?.title ?? ''}" (puede no permitir reproducción embebida). Pasando a la siguiente.`);
     step(1);
   };
 
+  /* iOS: la primera reproducción necesita un toque dentro del reproductor (que va invisible sobre el botón de play). Si en 1,5 s no ha empezado solo, se avisa. */
+  const curVideo = nowIdx !== null ? queue[nowIdx]?.videoId : undefined;
+  useEffect(() => {
+    if (!curVideo || !playing || unlocked) return;
+    const t = setTimeout(() => { setAwaitingTap(true); setExpanded(false); }, 1500);
+    return () => clearTimeout(t);
+  }, [curVideo, playing, unlocked]);
+  const onPlayingChange = (p: boolean) => {
+    setPlaying(p);
+    if (p) { setUnlocked(true); setAwaitingTap(false); }
+  };
+
   /* ---------- Datos derivados ---------- */
+  const nowVideoId = nowIdx !== null ? queue[nowIdx]?.videoId : undefined;
   const nowTrackId = nowIdx !== null ? queue[nowIdx]?.trackId : undefined;
   const nOf = (st: string) => entries.filter(e => e.status === st).length;
   const ready = nOf('auto') + nOf('manual');
@@ -2890,6 +4317,7 @@ export default function App() {
 
       <Btn tone="soft" label="Diagnóstico de YouTube Music" onPress={onDebug} />
       {debugOut && <Text style={s.mono}>{debugOut}</Text>}
+      {engineLog.length > 0 && <Text style={s.mono}>{'Reproductor:\n' + engineLog.join('\n')}</Text>}
     </ScrollView>
   );
 
@@ -2946,7 +4374,7 @@ export default function App() {
               key={e.position} index={e.position + 1} title={e.track.title} artists={e.track.artists.join(', ')}
               videoCaption={v ? `↳ ${v.title} — ${v.artists.join(', ')}` : undefined}
               status={e.status} isNow={e.track.id === nowTrackId} playable={!!v}
-              onPress={() => startAt(e.track.id)}
+              onPress={() => startAt(e.track.id)} onSearch={() => setManualFor(e.track)}
             />
           );
         })}
@@ -2956,10 +4384,13 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
+      <View style={{ flex: 1 }}>
       <SafeAreaView style={s.safe}>
         {tab === 'review' && db
-          ? <ReviewScreen db={db} onChanged={() => countByStatus(db).then(setCounts)} />
-          : (current ? detail : library)}
+          ? <ReviewScreen db={db} search={search} onChanged={() => countByStatus(db).then(setCounts)} />
+          : tab === 'search' && db
+            ? <SearchScreen db={db} search={search} nowVideoId={nowVideoId} onPlay={playSearchResult} />
+            : (current ? detail : library)}
 
         {tab === 'library' && current && hasPlayable && (
           <View style={s.actionBar}>
@@ -2969,17 +4400,63 @@ export default function App() {
         )}
 
         {nowIdx !== null && queue[nowIdx] && (
-          <PlayerDock
-            item={queue[nowIdx]} playing={playing} shuffle={shuffle}
-            onToggle={() => setPlaying(p => !p)} onNext={() => step(1)} onPrev={() => step(-1)}
-            onClose={() => { setNowIdx(null); setPlaying(false); }}
-            onToggleShuffle={toggleShuffle} onEnded={() => step(1)} onError={onPlayerError} onPlayingChange={setPlaying}
+          <>
+            <MiniPlayerWithProgress
+              item={queue[nowIdx]} playing={playing} engine={engine} awaitingTap={awaitingTap}
+              player={
+                <YouTubePlayer
+                  ref={engine} videoId={queue[nowIdx].videoId} playing={playing} catchTap={!unlocked} onLog={log}
+                  onEnded={onEnded} onError={onPlayerError} onPlayingChange={onPlayingChange}
+                />
+              }
+              onOpen={() => { if (unlocked && !awaitingTap) setExpanded(true); }}
+              onToggle={() => setPlaying(p => !p)} onNext={() => step(1)}
+            />
+          </>
+        )}
+
+        {manualFor && db && current && (
+          <ManualSearch
+            db={db} track={manualFor} search={search}
+            currentVideoId={entries.find(e => e.track.id === manualFor.id)?.videoId}
+            onClose={() => setManualFor(null)}
+            onPicked={async v => {
+              setManualFor(null);
+              setMessage(`"${manualFor.title}" ahora usa: ${v.title} — ${v.artists.join(', ')}.`);
+              await refresh(db, current.playlistId);
+              setPlaylists(await listPlaylists(db));
+            }}
           />
         )}
 
         <TabBar tab={tab} onChange={goTab} pending={counts.pending ?? 0} />
       </SafeAreaView>
+
+        {expanded && !awaitingTap && nowIdx !== null && queue[nowIdx] && (
+          <NowPlaying
+            item={queue[nowIdx]} source={source} playing={playing} shuffle={shuffle} repeat={repeat} engine={engine}
+            onClose={() => setExpanded(false)} onToggle={() => setPlaying(p => !p)}
+            onNext={() => step(1)} onPrev={onPrev}
+            onToggleShuffle={toggleShuffle} onCycleRepeat={() => setRepeat(nextRepeat)}
+          />
+        )}
+      </View>
     </SafeAreaProvider>
+  );
+}
+
+/** Mini-reproductor con su propio sondeo de progreso (así App no se redibuja cada 0,5 s). */
+function MiniPlayerWithProgress({ item, playing, engine, awaitingTap, player, onOpen, onToggle, onNext }: {
+  item: QueueItem; playing: boolean; engine: React.RefObject<PlayerHandle | null>; awaitingTap: boolean; player: React.ReactNode;
+  onOpen: () => void; onToggle: () => void; onNext: () => void;
+}) {
+  const { position, duration } = usePlayerProgress(engine, playing, item.videoId);
+  return (
+    <MiniPlayer
+      item={item} playing={playing} progress={duration > 0 ? position / duration : 0}
+      awaitingTap={awaitingTap} engine={player}
+      onOpen={onOpen} onToggle={onToggle} onNext={onNext}
+    />
   );
 }
 
@@ -3028,7 +4505,7 @@ const s = StyleSheet.create({
 <file path="CONTEXT.md">
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **rediseño de UI v2 (paso 9)** y botón aleatorio. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **reproductor estilo Spotify (paso 12)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -3133,10 +4610,36 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - Home "Tu música, siempre a mano": buscador de playlists (filtra por nombre) + botón óxido "+" que muestra/oculta el banner marrón de importación (visible siempre si no hay playlists); chips Todas/Completas/Con dudosas; cuadrícula 2 columnas de tarjetas (disco + franja marrón con nombre y botón borrar). Detalle: cabecera con atrás/borrar, disco grande, nombre + "listas/total" a lo grande, chips Todas/Dudosas/Sin resultado (filtran la lista), Buscar coincidencias con barra de progreso, filas de canción con estado y vídeo elegido, y barra fija inferior "Reproducir" + botón cuadrado aleatorio.
 - Aleatorio: `shuffleQueue` en `queue.ts` (tests incluidos); botón en la barra de la playlist y en el reproductor (activar/desactivar en marcha conserva la canción actual; la cola original está en `base`).
 
+## Paso 10 — Búsqueda manual (hecho; 67 tests OK en sandbox; UI NO ejecutada ni comprobada con tsc fuera del núcleo)
+- Sirve para corregir una canción mal asignada o sin resultado: el usuario busca en YT Music y elige el vídeo exacto (queda `manual`, nunca lo pisa un nuevo matching).
+- `src/core/matching/manualSearch.ts`: `defaultManualQuery(track)`, `searchManual(track, query, search)` (une búsqueda "Canciones" + sin filtro, sin duplicados, descarta kind 'other', puntúa contra la canción solo como orientación, ordena por score, máx. 15; si falla una búsqueda usa la otra; si fallan ambas lanza).
+- `repository.ts`: `resolveManualFromSearch(db, trackId, candidate, result)` (transacción: INSERT OR REPLACE en `candidates` + match manual; necesario porque `getChosenVideos` hace join con `candidates`).
+- `src/ui/ManualSearch.tsx`: Modal pageSheet con la canción original, campo de búsqueda (precargado "artista título", busca al abrir), resultados con tipo CANCIÓN/VÍDEO, puntos, motivos/avisos, Elegir / Escuchar; marca "Elegida" el vídeo actual.
+- Puntos de entrada: icono lupa en cada `TrackRow` de la playlist (`onSearch`) y botón "Buscar manualmente" en `ReviewScreen` (nueva prop `search`).
+- `tests/manualSearch.test.ts` (10 tests). Total esperado: 67.
+
+## Paso 11 — Pestaña Buscar + añadir a playlist (hecho; 76 tests OK en sandbox; UI NO ejecutada)
+- **Migración v2** (`SCHEMA_VERSION`=2): `tracks.youtube_id` + índice único parcial. Las canciones añadidas desde la búsqueda no tienen `spotify_id`; se identifican por su vídeo (no se duplican entre playlists). `Track.externalIds.youtubeVideo` ahora se rellena.
+- `src/core/search/searchSongs.ts` (`searchSongs`: filtro Canciones, reintento sin filtro, dedupe, máx. 20).
+- `repository.ts`: `createPlaylist(db, name)` (playlist propia sin Spotify), `addYoutubeTrackToPlaylist(db, playlistId, input)` (transacción; añade al final; no repite en la misma playlist; deja coincidencia `manual` + candidato para que se vea y reproduzca) y `YoutubeTrackInput`.
+- UI: `src/ui/SearchScreen.tsx` (nueva pestaña con lupa en `TabBar`, orden Biblioteca / Buscar / Revisar; tocar resultado = reproducir en el PlayerDock; botón + = añadir), `src/ui/AddToPlaylistSheet.tsx` (lista de playlists + "Nueva playlist"). `App.tsx`: `playSearchResult` (cola de 1 canción), `nowVideoId`.
+- **Limitación conocida:** reimportar una playlist de Spotify (`savePlaylist`) reescribe sus canciones y borraría las añadidas a mano a esa misma playlist. Pendiente decidir: proteger o fusionar.
+- Pendiente posible: quitar canciones de una playlist, reordenar, resultados de "Vídeos", historial de búsquedas.
+
+## Paso 12 — Reproductor estilo Spotify (hecho; tests del núcleo OK; UI NO ejecutada ni tipada en sandbox)
+- Petición del usuario: no mostrar el vídeo al reproducir; interfaz como la del reproductor de Spotify (captura de referencia: cabecera "Reproduciendo desde", portada grande, título/artista, barra de progreso con tiempos, shuffle/anterior/play/siguiente/repetir) pero con nuestra paleta.
+- `YouTubePlayer.tsx` reescrito (`forwardRef`, `PlayerHandle`: getCurrentTime/getDuration/seekTo). El iframe va oculto en un contenedor de 1×1 px con overflow hidden (opacity 0.01) montado en App mientras haya canción. **Riesgo no verificado:** si iOS/Expo Go pausara el WebView así, hay que probar con un contenedor mayor o cambiar de motor.
+- Nuevos: `Cover.tsx` (miniatura `i.ytimg.com/vi/ID/hqdefault.jpg` recortada al cuadrado; fallback Disc), `Slider.tsx` (PanResponder), `usePlayerProgress.ts` (sondeo cada 500 ms), `MiniPlayer.tsx` (barra compacta con progreso; tocar abre pantalla completa), `NowPlaying.tsx` (Modal fullScreen), `core/player/format.ts` (`formatClock`, `thumbnailUrl`, `clamp01`). `queue.ts`: `RepeatMode`, `nextRepeat`, `nextIndex`. `kit.tsx`: IconBtn tone `light`.
+- `App.tsx`: estados `repeat`, `expanded`, `source`; "anterior" vuelve al inicio si han pasado >3 s; repetir uno/todo; `PlayerDock.tsx` ya no se usa (se puede borrar).
+- **Primer toque en iOS (solución v2, sustituye al vídeo visible que se descartó por feo):** iOS exige un toque dentro del WebView para la primera reproducción. El `YouTubePlayer` (invisible, opacidad 0.02) se monta DENTRO del botón de play del `MiniPlayer` (prop `engine`), con el centro del iframe bajo el dedo (`catchTap={!unlocked}`), de modo que el toque normal sobre ▶ es el gesto real. Si 1,5 s después de pedir reproducir no ha llegado 'playing' (`awaitingTap`), el mini-reproductor muestra "Toca ▶ para empezar" y un aro que late. Tras el primer 'playing' (`unlocked`) el reproductor vuelve a 1×1 px y no se pide más hasta reiniciar la app. Mientras `awaitingTap` no se abre la pantalla completa. NO verificado en dispositivo; riesgos: iOS ignore toques con alfa 0.02 (alternativa: subir a 0.05) o que el toque en el centro del iframe no arranque (alternativa: ampliar el iframe).
+- **Fallo reportado tras la v2 (1 s de sonido y se para; ⏯ no responde):** hipótesis = el cambio de tamaño/posición del reproductor al desbloquearse (v2 pasaba a 1×1 px) hacía que iOS lo pausara. Corrección: el contenedor es SIEMPRE el mismo (tamaño del botón, opacidad 0.05, zIndex 10) y solo alterna `pointerEvents` (`catchTap`). `onOpen` del mini-reproductor exige `unlocked`. Añadido `onLog` en `YouTubePlayer` y `engineLog` en `App.tsx`: la home (Biblioteca) muestra "Reproductor:" con los últimos 12 eventos (estado/errores) para diagnosticar si persiste. NO verificado en dispositivo.
+- **Fallo reportado (v3): al expandir el mini-reproductor se para y no responde.** Causa: `NowPlaying` era un `<Modal presentationStyle="fullScreen">`; iOS retira la vista de debajo de la ventana y el WebView del reproductor se pausa/queda inutilizable. Corrección: `NowPlaying` es ahora una capa `Animated.View` absoluta (zIndex 100) dentro de la app, hermana del `SafeAreaView` en `App.tsx` (raíz: `SafeAreaProvider > View flex:1 > [SafeAreaView, NowPlaying]`), con animación de subida, botón atrás de Android y arrastre hacia abajo desde la cabecera para cerrar. **Regla:** nada que cubra el reproductor puede ser un Modal a pantalla completa. (Los Modal `pageSheet` de ManualSearch/AddToPlaylistSheet dejan la vista de debajo en la jerarquía; pendiente comprobar que no pausan la música.)
+- Sin gradiente de fondo (haría falta `expo-linear-gradient`); fondo marrón sólido.
+
 ## Siguiente sesión (orden recomendado)
 - **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).
 - Verificado por el usuario: paso 8 (biblioteca) funciona.
-- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) búsqueda manual para corregir una canción mal asignada o sin resultado (✖️); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
+- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) ✅ HECHO en paso 10 (búsqueda manual); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
 - Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project`.
 
 ## Pendiente de preguntar / decidir
