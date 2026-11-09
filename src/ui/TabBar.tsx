@@ -3,7 +3,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Icon, IconName } from './kit';
 import { colors, radius } from './theme';
 
-export type Tab = 'library' | 'review';
+export type Tab = 'library' | 'search' | 'review';
 
 /** Barra flotante en forma de píldora marrón. */
 export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab) => void; pending: number }) {
@@ -17,6 +17,7 @@ export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab
     <View style={s.wrap}>
       <View style={s.pill}>
         {item('library', tab === 'library' ? 'albums' : 'albums-outline')}
+        {item('search', tab === 'search' ? 'search' : 'search-outline')}
         {item('review', tab === 'review' ? 'checkmark-done' : 'checkmark-done-outline', pending)}
       </View>
     </View>

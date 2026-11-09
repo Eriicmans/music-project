@@ -54,8 +54,11 @@ src/
       matchTrack.ts
       parseTitle.ts
       scoreCandidate.ts
+    player/
+      queue.ts
   db/
     database.ts
+    matchingAdapter.ts
     migrations.ts
     openDb.ts
     repository.ts
@@ -71,12 +74,21 @@ src/
     youtubeMusic/
       search.ts
       toCandidate.ts
+  ui/
+    cards.tsx
+    kit.tsx
+    PlayerDock.tsx
+    ReviewScreen.tsx
+    TabBar.tsx
+    theme.ts
+    YouTubePlayer.tsx
 tests/
   helpers/
     nodeSqliteDb.ts
   db.test.ts
   matching-cases.md
   matchQueue.test.ts
+  queue.test.ts
   scoreCandidate.test.ts
   spotify.test.ts
   youtubeMusic.test.ts
@@ -475,6 +487,32 @@ export interface Db {
 }
 </file>
 
+<file path="src/db/matchingAdapter.ts">
+import { Track } from '../models/Track';
+import { QueueDeps } from '../core/matching/matchQueue';
+import { SearchFn } from '../core/matching/matchTrack';
+import { Db } from './database';
+import { getMatchStatus, recordMatching } from './repository';
+
+/**
+ * Conecta la cola de matching con la base de datos.
+ * Se omiten las canciones ya resueltas (auto/manual) o pendientes de revisión;
+ * las que quedaron en 'none' se reintentan.
+ */
+export function makeQueueDeps(db: Db, search: SearchFn): QueueDeps {
+  return {
+    search,
+    record: async (track: Track, scored) => {
+      await recordMatching(db, track.id, scored);
+    },
+    shouldSkip: async (track: Track) => {
+      const m = await getMatchStatus(db, track.id);
+      return m?.status === 'auto' || m?.status === 'manual' || m?.status === 'pending';
+    },
+  };
+}
+</file>
+
 <file path="src/db/migrations.ts">
 import { Db } from './database';
 
@@ -572,198 +610,6 @@ export function openDb(): Promise<Db> {
     opening.catch(() => { opening = null; });
   }
   return opening;
-}
-</file>
-
-<file path="src/db/repository.ts">
-import { Track, TrackCandidate, TrackVersion } from '../models/Track';
-import { MatchResult } from '../core/matching/scoreCandidate';
-import { Db } from './database';
-
-export type MatchStatus = 'auto' | 'manual' | 'pending' | 'none';
-export interface ScoredCandidate { candidate: TrackCandidate; result: MatchResult }
-export interface StoredCandidate extends TrackCandidate { score: number; decision: string; reasons: string[]; conflicts: string[]; warnings: string[] }
-
-const MAX_CANDIDATES = 5;
-const now = () => Date.now();
-export const newId = (): string =>
-  Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
-
-interface TrackRow {
-  id: string; spotify_id: string | null; title: string; artists: string; album: string | null;
-  duration_ms: number | null; isrc: string | null; version: string; musicbrainz_id: string | null;
-}
-const toTrack = (r: TrackRow): Track => ({
-  id: r.id, title: r.title, artists: JSON.parse(r.artists) as string[],
-  album: r.album ?? undefined, durationMs: r.duration_ms ?? undefined, isrc: r.isrc ?? undefined,
-  version: r.version as TrackVersion,
-  externalIds: { spotify: r.spotify_id ?? undefined, musicBrainzRecording: r.musicbrainz_id ?? undefined },
-});
-
-/** Inserta la canción o actualiza la existente (clave: id de Spotify). Devuelve el id interno. */
-export async function upsertTrack(db: Db, track: Track): Promise<string> {
-  const spotify = track.externalIds.spotify ?? null;
-  if (spotify) {
-    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE spotify_id = ?', [spotify]);
-    if (existing) {
-      await db.runAsync(
-        'UPDATE tracks SET title=?, artists=?, album=?, duration_ms=?, isrc=?, version=? WHERE id=?',
-        [track.title, JSON.stringify(track.artists), track.album ?? null, track.durationMs ?? null,
-         track.isrc ?? null, track.version, existing.id]);
-      return existing.id;
-    }
-  }
-  await db.runAsync(
-    `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-    [track.id, spotify, track.title, JSON.stringify(track.artists), track.album ?? null,
-     track.durationMs ?? null, track.isrc ?? null, track.version,
-     track.externalIds.musicBrainzRecording ?? null, now()]);
-  return track.id;
-}
-
-export async function getTrack(db: Db, id: string): Promise<Track | null> {
-  const row = await db.getFirstAsync<TrackRow>('SELECT * FROM tracks WHERE id = ?', [id]);
-  return row ? toTrack(row) : null;
-}
-
-/**
- * Guarda una playlist y el orden de sus canciones. Reimportar la misma playlist
- * (mismo spotifyId) la actualiza en vez de duplicarla.
- */
-export async function savePlaylist(
-  db: Db,
-  playlist: { name: string; spotifyId?: string; sourceUrl?: string },
-  trackIds: string[],
-): Promise<string> {
-  let id: string | undefined;
-  if (playlist.spotifyId) {
-    id = (await db.getFirstAsync<{ id: string }>('SELECT id FROM playlists WHERE spotify_id = ?', [playlist.spotifyId]))?.id;
-  }
-  await db.execAsync('BEGIN');
-  try {
-    if (id) {
-      await db.runAsync('UPDATE playlists SET name=?, source_url=? WHERE id=?', [playlist.name, playlist.sourceUrl ?? null, id]);
-      await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [id]);
-    } else {
-      id = newId();
-      await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,?,?,?,?)',
-        [id, playlist.spotifyId ?? null, playlist.name, playlist.sourceUrl ?? null, now()]);
-    }
-    for (let i = 0; i < trackIds.length; i++) {
-      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, trackIds[i]]);
-    }
-    await db.execAsync('COMMIT');
-  } catch (error) {
-    await db.execAsync('ROLLBACK');
-    throw error;
-  }
-  return id;
-}
-
-export interface PlaylistEntry { position: number; track: Track; status: MatchStatus | null; videoId: string | null }
-
-export async function getPlaylistEntries(db: Db, playlistId: string): Promise<PlaylistEntry[]> {
-  const rows = await db.getAllAsync<TrackRow & { position: number; m_status: string | null; m_video: string | null }>(
-    `SELECT t.*, pt.position, m.status AS m_status, m.video_id AS m_video
-     FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
-     LEFT JOIN matches m ON m.track_id = t.id
-     WHERE pt.playlist_id = ? ORDER BY pt.position`, [playlistId]);
-  return rows.map(r => ({ position: r.position, track: toTrack(r), status: r.m_status as MatchStatus | null, videoId: r.m_video }));
-}
-
-/** Caché: vídeo ya resuelto (auto o manual) para una canción de Spotify. */
-export async function getCachedVideoId(db: Db, spotifyId: string): Promise<string | null> {
-  const row = await db.getFirstAsync<{ video_id: string }>(
-    `SELECT m.video_id FROM matches m JOIN tracks t ON t.id = m.track_id
-     WHERE t.spotify_id = ? AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL`, [spotifyId]);
-  return row?.video_id ?? null;
-}
-
-export async function getMatchStatus(db: Db, trackId: string): Promise<{ status: MatchStatus; videoId: string | null } | null> {
-  const row = await db.getFirstAsync<{ status: string; video_id: string | null }>(
-    'SELECT status, video_id FROM matches WHERE track_id = ?', [trackId]);
-  return row ? { status: row.status as MatchStatus, videoId: row.video_id } : null;
-}
-
-async function setMatch(db: Db, trackId: string, status: MatchStatus, videoId: string | null, score: number | null) {
-  await db.runAsync(
-    `INSERT INTO matches (track_id, video_id, status, score, updated_at) VALUES (?,?,?,?,?)
-     ON CONFLICT(track_id) DO UPDATE SET video_id=excluded.video_id, status=excluded.status,
-       score=excluded.score, updated_at=excluded.updated_at`,
-    [trackId, videoId, status, score, now()]);
-}
-
-/**
- * Registra el resultado del matching de una canción. Una decisión manual
- * previa del usuario nunca se sobrescribe.
- */
-export async function recordMatching(db: Db, trackId: string, scored: ScoredCandidate[]): Promise<MatchStatus> {
-  const current = await getMatchStatus(db, trackId);
-  if (current?.status === 'manual') return 'manual';
-
-  const usable = scored
-    .filter(s => s.result.decision !== 'reject')
-    .sort((a, b) => b.result.score - a.result.score)
-    .slice(0, MAX_CANDIDATES);
-
-  await db.runAsync('DELETE FROM candidates WHERE track_id = ?', [trackId]);
-  for (const { candidate: c, result: r } of usable) {
-    await db.runAsync(
-      `INSERT INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
-         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [trackId, c.provider, c.externalId, c.title, JSON.stringify(c.artists), c.durationMs ?? null, c.version,
-       r.score, r.decision, JSON.stringify(r.reasons), JSON.stringify(r.conflicts), JSON.stringify(r.warnings)]);
-  }
-
-  const best = usable[0];
-  if (best && best.result.decision === 'auto' && best.candidate.provider === 'youtube') {
-    await setMatch(db, trackId, 'auto', best.candidate.externalId, best.result.score);
-    return 'auto';
-  }
-  if (usable.length > 0) {
-    await setMatch(db, trackId, 'pending', null, best.result.score);
-    return 'pending';
-  }
-  await setMatch(db, trackId, 'none', null, null);
-  return 'none';
-}
-
-/** El usuario elige un vídeo concreto para una canción. */
-export async function resolveManual(db: Db, trackId: string, videoId: string): Promise<void> {
-  await setMatch(db, trackId, 'manual', videoId, null);
-}
-
-export interface PendingReview { track: Track; candidates: StoredCandidate[] }
-
-export async function listPendingReviews(db: Db): Promise<PendingReview[]> {
-  const rows = await db.getAllAsync<TrackRow>(
-    `SELECT t.* FROM tracks t JOIN matches m ON m.track_id = t.id
-     WHERE m.status = 'pending' ORDER BY t.created_at, t.title`);
-  const out: PendingReview[] = [];
-  for (const row of rows) {
-    const cands = await db.getAllAsync<{
-      provider: string; external_id: string; title: string; artists: string; duration_ms: number | null;
-      version: string; score: number; decision: string; reasons: string; conflicts: string; warnings: string;
-    }>('SELECT * FROM candidates WHERE track_id = ? ORDER BY score DESC', [row.id]);
-    out.push({
-      track: toTrack(row),
-      candidates: cands.map(c => ({
-        provider: c.provider as TrackCandidate['provider'], externalId: c.external_id, title: c.title,
-        artists: JSON.parse(c.artists), durationMs: c.duration_ms ?? undefined, version: c.version as TrackVersion,
-        score: c.score, decision: c.decision, reasons: JSON.parse(c.reasons),
-        conflicts: JSON.parse(c.conflicts), warnings: JSON.parse(c.warnings),
-      })),
-    });
-  }
-  return out;
-}
-
-export async function countByStatus(db: Db): Promise<Record<string, number>> {
-  const rows = await db.getAllAsync<{ status: string; n: number }>('SELECT status, COUNT(*) AS n FROM matches GROUP BY status');
-  const out: Record<string, number> = {};
-  for (const r of rows) out[r.status] = r.n;
-  return out;
 }
 </file>
 
@@ -1169,6 +1015,386 @@ export function toCandidate(r: YtResult): TrackCandidate {
 }
 </file>
 
+<file path="src/ui/cards.tsx">
+import React from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { PlaylistInfo } from '../db/repository';
+import { Disc, Icon, StatusDot } from './kit';
+import { colors, radius } from './theme';
+
+/** Tarjeta de playlist: zona clara con el disco y franja marrón con el nombre. */
+export function PlaylistCard({ info, width, onPress, onDelete }: {
+  info: PlaylistInfo; width: number; onPress: () => void; onDelete: () => void;
+}) {
+  const meta = info.pending > 0 ? `${info.pending} dudosas` : `${info.total} canciones`;
+  return (
+    <Pressable onPress={onPress} style={[s.card, { width }]}>
+      <View style={[s.top, { height: width * 0.78 }]}>
+        <Disc seed={info.name} size={width * 0.54} />
+      </View>
+      <View style={s.bottom}>
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text style={s.meta} numberOfLines={1}>{meta}</Text>
+          <Text style={s.name} numberOfLines={1}>{info.name}</Text>
+        </View>
+        <Pressable onPress={onDelete} hitSlop={8} style={s.round}>
+          <Icon name="trash-outline" size={15} color={colors.dark} />
+        </Pressable>
+      </View>
+    </Pressable>
+  );
+}
+
+/** Fila de canción con el vídeo elegido debajo. */
+export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress }: {
+  index: number; title: string; artists: string; videoCaption?: string; status: string | null;
+  isNow: boolean; playable: boolean; onPress: () => void;
+}) {
+  return (
+    <Pressable onPress={onPress} disabled={!playable} style={s.row}>
+      <View style={[s.num, isNow && { backgroundColor: colors.accent }]}>
+        {isNow
+          ? <Icon name="musical-notes" size={16} color={colors.onAccent} />
+          : <Text style={s.numText}>{String(index).padStart(2, '0')}</Text>}
+      </View>
+      <View style={{ flex: 1, gap: 1 }}>
+        <Text style={[s.title, isNow && { color: colors.accent }]} numberOfLines={1}>{title}</Text>
+        <Text style={s.artist} numberOfLines={1}>{artists}</Text>
+        {videoCaption ? <Text style={s.caption} numberOfLines={1}>{videoCaption}</Text> : null}
+      </View>
+      <StatusDot status={status} />
+    </Pressable>
+  );
+}
+
+const s = StyleSheet.create({
+  card: { borderRadius: radius.lg, overflow: 'hidden', backgroundColor: colors.chip },
+  top: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.chip },
+  bottom: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.dark, padding: 12, borderRadius: radius.lg },
+  meta: { color: colors.onDarkMuted, fontSize: 11 },
+  name: { color: colors.onDark, fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
+  round: { width: 30, height: 30, borderRadius: 15, backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center' },
+  row: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, padding: 10, paddingRight: 16,
+    backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line,
+  },
+  num: { width: 40, height: 40, borderRadius: radius.sm, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
+  numText: { color: colors.muted, fontSize: 13, fontWeight: '700' },
+  title: { color: colors.text, fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
+  artist: { color: colors.muted, fontSize: 13 },
+  caption: { color: colors.faint, fontSize: 11, fontStyle: 'italic' },
+});
+</file>
+
+<file path="src/ui/kit.tsx">
+import React from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import { colors, radius } from './theme';
+
+/* ---------- Iconos (Ionicons) ---------- */
+export type IconName = React.ComponentProps<typeof Ionicons>['name'];
+
+export function Icon({ name, size = 20, color = colors.text }: { name: IconName; size?: number; color?: string }) {
+  return <Ionicons name={name} size={size} color={color} />;
+}
+
+/* ---------- Botón cuadrado redondeado con icono ---------- */
+type IconTone = 'soft' | 'accent' | 'dark' | 'ghost';
+const ICON_BG: Record<IconTone, string> = { soft: colors.chip, accent: colors.accent, dark: colors.dark, ghost: 'transparent' };
+const ICON_FG: Record<IconTone, string> = { soft: colors.text, accent: colors.onAccent, dark: colors.onDark, ghost: colors.text };
+
+export function IconBtn({ name, onPress, tone = 'soft', size = 46, iconSize = 20, badge, disabled }: {
+  name: IconName; onPress: () => void; tone?: IconTone; size?: number; iconSize?: number; badge?: number; disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress} disabled={disabled} hitSlop={6}
+      style={({ pressed }) => ({
+        width: size, height: size, borderRadius: radius.md, backgroundColor: ICON_BG[tone],
+        alignItems: 'center', justifyContent: 'center', opacity: disabled ? 0.35 : pressed ? 0.8 : 1,
+      })}
+    >
+      <Icon name={name} size={iconSize} color={ICON_FG[tone]} />
+      {badge ? (
+        <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View>
+      ) : null}
+    </Pressable>
+  );
+}
+
+/* ---------- Botón con texto ---------- */
+type BtnTone = 'accent' | 'dark' | 'soft' | 'light';
+const BTN_BG: Record<BtnTone, string> = { accent: colors.accent, dark: colors.dark, soft: colors.chip, light: colors.onDark };
+const BTN_FG: Record<BtnTone, string> = { accent: colors.onAccent, dark: colors.onDark, soft: colors.text, light: colors.dark };
+
+export function Btn({ label, onPress, tone = 'accent', disabled, busy, flex, icon }: {
+  label: string; onPress: () => void; tone?: BtnTone; disabled?: boolean; busy?: boolean; flex?: boolean; icon?: IconName;
+}) {
+  return (
+    <Pressable
+      onPress={onPress} disabled={disabled || busy}
+      style={({ pressed }) => [
+        s.btn, { backgroundColor: BTN_BG[tone] }, flex && { flex: 1 },
+        (disabled || pressed) && { opacity: disabled ? 0.4 : 0.85 },
+      ]}
+    >
+      {busy ? <ActivityIndicator color={BTN_FG[tone]} /> : (
+        <View style={s.btnInner}>
+          {icon && <Icon name={icon} size={17} color={BTN_FG[tone]} />}
+          <Text style={[s.btnText, { color: BTN_FG[tone] }]}>{label}</Text>
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
+/* ---------- Chip de filtro ---------- */
+export function Chip({ label, selected, onPress, tone = 'accent' }: {
+  label: string; selected: boolean; onPress: () => void; tone?: 'accent' | 'dark';
+}) {
+  const on = tone === 'dark' ? colors.dark : colors.accent;
+  return (
+    <Pressable onPress={onPress} style={[s.chip, { backgroundColor: selected ? on : colors.chip }]}>
+      <Text style={[s.chipText, { color: selected ? colors.onAccent : colors.text }]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+/* ---------- Disco (portada sin imagen) ---------- */
+const TINTS = ['#6B3F22', '#8A5A33', '#9A5A3A', '#5A3A28', '#7C4A2D', '#946B45'];
+const hash = (v: string) => { let h = 0; for (let i = 0; i < v.length; i++) h = (h * 31 + v.charCodeAt(i)) | 0; return Math.abs(h); };
+
+export function Disc({ seed, size = 56 }: { seed: string; size?: number }) {
+  const ring = (f: number, o: number) => ({
+    position: 'absolute' as const, width: size * f, height: size * f, borderRadius: (size * f) / 2,
+    borderWidth: 1, borderColor: `rgba(244,239,230,${o})`,
+  });
+  return (
+    <View style={{
+      width: size, height: size, borderRadius: size / 2, backgroundColor: TINTS[hash(seed) % TINTS.length],
+      alignItems: 'center', justifyContent: 'center',
+    }}>
+      <View style={ring(0.86, 0.16)} />
+      <View style={ring(0.66, 0.12)} />
+      <View style={ring(0.46, 0.1)} />
+      <View style={{ width: size * 0.28, height: size * 0.28, borderRadius: size * 0.14, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: size * 0.07, height: size * 0.07, borderRadius: size * 0.035, backgroundColor: colors.dark }} />
+      </View>
+    </View>
+  );
+}
+
+/* ---------- Estado de coincidencia ---------- */
+export function StatusDot({ status }: { status: string | null }) {
+  const filled = status === 'auto' ? colors.dark : status === 'manual' ? colors.gold : status === 'pending' ? colors.terracotta : null;
+  return (
+    <View style={{
+      width: 9, height: 9, borderRadius: 5, backgroundColor: filled ?? 'transparent',
+      borderWidth: filled ? 0 : 1.5, borderColor: colors.faint,
+    }} />
+  );
+}
+
+const s = StyleSheet.create({
+  badge: {
+    position: 'absolute', top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 4,
+    backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
+  },
+  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
+  btn: { borderRadius: radius.md, paddingVertical: 15, paddingHorizontal: 18, alignItems: 'center', justifyContent: 'center' },
+  btnInner: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  btnText: { fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
+  chip: { borderRadius: radius.sm, paddingVertical: 10, paddingHorizontal: 16 },
+  chipText: { fontSize: 13, fontWeight: '700' },
+});
+</file>
+
+<file path="src/ui/PlayerDock.tsx">
+import React from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { QueueItem } from '../core/player/queue';
+import { Icon, IconBtn } from './kit';
+import { colors, radius } from './theme';
+import { YouTubePlayer } from './YouTubePlayer';
+
+interface Props {
+  item: QueueItem;
+  playing: boolean;
+  shuffle: boolean;
+  onToggle: () => void;
+  onNext: () => void;
+  onPrev: () => void;
+  onClose: () => void;
+  onToggleShuffle: () => void;
+  onEnded: () => void;
+  onError: (reason: string) => void;
+  onPlayingChange: (p: boolean) => void;
+}
+
+/** Reproductor: tarjeta marrón con el vídeo, el título y los controles. */
+export function PlayerDock(p: Props) {
+  return (
+    <View style={s.dock}>
+      <View style={s.video}>
+        <YouTubePlayer
+          videoId={p.item.videoId} playing={p.playing}
+          onEnded={p.onEnded} onError={p.onError} onPlayingChange={p.onPlayingChange}
+        />
+      </View>
+      <View style={s.info}>
+        <View style={{ flex: 1, gap: 1 }}>
+          <Text style={s.title} numberOfLines={1}>{p.item.title}</Text>
+          <Text style={s.artist} numberOfLines={1}>{p.item.artists.join(', ')}</Text>
+        </View>
+        <Pressable onPress={p.onClose} hitSlop={12}><Icon name="close" size={20} color={colors.onDarkMuted} /></Pressable>
+      </View>
+      <View style={s.controls}>
+        <IconBtn name="shuffle" size={42} iconSize={18} tone={p.shuffle ? 'accent' : 'ghost'} onPress={p.onToggleShuffle} />
+        <View style={s.transport}>
+          <Pressable onPress={p.onPrev} hitSlop={12}><Icon name="play-skip-back" size={24} color={colors.onDark} /></Pressable>
+          <Pressable onPress={p.onToggle} style={s.main}>
+            <Icon name={p.playing ? 'pause' : 'play'} size={24} color={colors.dark} />
+          </Pressable>
+          <Pressable onPress={p.onNext} hitSlop={12}><Icon name="play-skip-forward" size={24} color={colors.onDark} /></Pressable>
+        </View>
+        <View style={{ width: 42 }} />
+      </View>
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  dock: { backgroundColor: colors.dark, borderRadius: radius.xl, marginHorizontal: 12, marginTop: 8, padding: 12, gap: 10 },
+  video: { borderRadius: radius.md, overflow: 'hidden' },
+  info: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 4 },
+  title: { color: colors.onDark, fontSize: 17, fontWeight: '800', letterSpacing: -0.3 },
+  artist: { color: colors.onDarkMuted, fontSize: 13 },
+  controls: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  transport: { flexDirection: 'row', alignItems: 'center', gap: 28 },
+  main: { width: 52, height: 52, borderRadius: 26, backgroundColor: colors.onDark, alignItems: 'center', justifyContent: 'center' },
+});
+</file>
+
+<file path="src/ui/TabBar.tsx">
+import React from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Icon, IconName } from './kit';
+import { colors, radius } from './theme';
+
+export type Tab = 'library' | 'review';
+
+/** Barra flotante en forma de píldora marrón. */
+export function TabBar({ tab, onChange, pending }: { tab: Tab; onChange: (t: Tab) => void; pending: number }) {
+  const item = (t: Tab, icon: IconName, badge?: number) => (
+    <Pressable onPress={() => onChange(t)} style={[s.item, tab === t && s.itemOn]}>
+      <Icon name={icon} size={22} color={tab === t ? colors.onDark : colors.onDarkMuted} />
+      {badge ? <View style={s.badge}><Text style={s.badgeText}>{badge > 99 ? '99+' : badge}</Text></View> : null}
+    </Pressable>
+  );
+  return (
+    <View style={s.wrap}>
+      <View style={s.pill}>
+        {item('library', tab === 'library' ? 'albums' : 'albums-outline')}
+        {item('review', tab === 'review' ? 'checkmark-done' : 'checkmark-done-outline', pending)}
+      </View>
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  wrap: { alignItems: 'center', paddingVertical: 8, backgroundColor: colors.bg },
+  pill: { flexDirection: 'row', gap: 6, padding: 6, borderRadius: radius.xl, backgroundColor: colors.dark },
+  item: { width: 62, height: 46, borderRadius: radius.lg, alignItems: 'center', justifyContent: 'center' },
+  itemOn: { backgroundColor: 'rgba(244,239,230,0.16)' },
+  badge: {
+    position: 'absolute', top: 2, right: 10, minWidth: 17, height: 17, borderRadius: 9, paddingHorizontal: 4,
+    backgroundColor: colors.terracotta, alignItems: 'center', justifyContent: 'center',
+  },
+  badgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
+});
+</file>
+
+<file path="src/ui/theme.ts">
+import { Platform, TextStyle } from 'react-native';
+
+/**
+ * Base: crema #F4EFE6 + marrón #523D2C. El marrón oscuro es el color de las
+ * superficies de contraste (banner, tarjetas, reproductor, barra); el óxido
+ * es el color de acción (botones, filtros activos).
+ */
+export const colors = {
+  bg: '#F4EFE6',
+  card: '#FBF9F5',
+  chip: '#E8E0D2',
+  line: '#E0D6C4',
+  text: '#33261B',
+  muted: '#7C6857',
+  faint: '#A99A88',
+  dark: '#523D2C',
+  onDark: '#F4EFE6',
+  onDarkMuted: 'rgba(244,239,230,0.66)',
+  onDarkLine: 'rgba(244,239,230,0.16)',
+  accent: '#9A5A3A',
+  onAccent: '#FBF6EE',
+  gold: '#B98B4E',
+  terracotta: '#C0562F',
+  danger: '#B2432C',
+  dangerBg: '#F1DAD0',
+};
+
+export const radius = { sm: 12, md: 16, lg: 20, xl: 26 };
+
+export const fonts = {
+  mono: Platform.select({ ios: 'Courier', default: 'monospace' }) as string,
+};
+
+const h1: TextStyle = { color: colors.text, fontSize: 32, lineHeight: 37, fontWeight: '800', letterSpacing: -0.9 };
+const h2: TextStyle = { color: colors.text, fontSize: 18, fontWeight: '800', letterSpacing: -0.3 };
+const body: TextStyle = { color: colors.muted, fontSize: 14, lineHeight: 20 };
+const small: TextStyle = { color: colors.muted, fontSize: 12, lineHeight: 17 };
+
+export const type = { h1, h2, body, small };
+</file>
+
+<file path="src/ui/YouTubePlayer.tsx">
+import React from 'react';
+import { useWindowDimensions } from 'react-native';
+import YoutubePlayer from 'react-native-youtube-iframe';
+
+export interface PlayerProps {
+  videoId: string;
+  playing: boolean;
+  onEnded: () => void;
+  onError: (reason: string) => void;
+  onPlayingChange: (playing: boolean) => void;
+}
+
+/**
+ * ÚNICO archivo que conoce el motor de reproducción (iframe oficial de YouTube).
+ * Para cambiar a otra vía (p. ej. audio en segundo plano) basta con reescribir
+ * este componente manteniendo las mismas props.
+ */
+export function YouTubePlayer({ videoId, playing, onEnded, onError, onPlayingChange }: PlayerProps) {
+  const { width } = useWindowDimensions();
+  const w = Math.max(200, width - 48);
+  return (
+    <YoutubePlayer
+      width={w}
+      height={Math.round((w * 9) / 16)}
+      videoId={videoId}
+      play={playing}
+      onChangeState={(state: string) => {
+        if (state === 'ended') onEnded();
+        else if (state === 'playing') onPlayingChange(true);
+        else if (state === 'paused') onPlayingChange(false);
+      }}
+      onError={(reason: string) => onError(reason)}
+    />
+  );
+}
+</file>
+
 <file path="tests/helpers/nodeSqliteDb.ts">
 /// <reference types="node" />
 import { DatabaseSync } from 'node:sqlite';
@@ -1186,103 +1412,6 @@ export function createTestDb(): Db {
     async getFirstAsync<T>(sql: string, params?: SqlParam[]) { return (db.prepare(sql).get(...bind(params)) as T | undefined) ?? null; },
   };
 }
-</file>
-
-<file path="tests/db.test.ts">
-import { beforeEach, describe, expect, it } from 'vitest';
-import { Db } from '../src/db/database';
-import { migrate, SCHEMA_VERSION } from '../src/db/migrations';
-import {
-  getCachedVideoId, getMatchStatus, getPlaylistEntries, getTrack, listPendingReviews,
-  recordMatching, resolveManual, savePlaylist, upsertTrack, countByStatus, ScoredCandidate,
-} from '../src/db/repository';
-import { scoreCandidate } from '../src/core/matching/scoreCandidate';
-import { Track, TrackCandidate } from '../src/models/Track';
-import { createTestDb } from './helpers/nodeSqliteDb';
-
-const track = (id: string, o: Partial<Track> = {}): Track => ({
-  id, title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'], album: 'Shawn Mendes',
-  durationMs: 190000, version: 'studio', externalIds: { spotify: 'sp_' + id }, ...o,
-});
-const cand = (id: string, o: Partial<TrackCandidate> = {}): TrackCandidate => ({
-  provider: 'youtube', externalId: id, title: 'Señorita', artists: ['Shawn Mendes'],
-  durationMs: 190500, version: 'studio', ...o,
-});
-const score = (t: Track, c: TrackCandidate): ScoredCandidate => ({ candidate: c, result: scoreCandidate(t, c) });
-
-let db: Db;
-beforeEach(async () => { db = createTestDb(); await migrate(db); });
-
-describe('migraciones', () => {
-  it('son idempotentes y fijan la versión', async () => {
-    expect(await migrate(db)).toBe(SCHEMA_VERSION);
-    const v = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
-    expect(v?.user_version).toBe(SCHEMA_VERSION);
-  });
-});
-
-describe('canciones', () => {
-  it('guarda y recupera con artistas como lista', async () => {
-    await upsertTrack(db, track('a'));
-    expect(await getTrack(db, 'a')).toMatchObject({ title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'] });
-  });
-  it('misma canción de Spotify no se duplica y conserva su id', async () => {
-    const id1 = await upsertTrack(db, track('a'));
-    const id2 = await upsertTrack(db, track('b', { externalIds: { spotify: 'sp_a' }, title: 'Señorita (v2)' }));
-    expect(id2).toBe(id1);
-    expect((await getTrack(db, id1))?.title).toBe('Señorita (v2)');
-  });
-});
-
-describe('playlists', () => {
-  it('conserva el orden y reimportar actualiza en vez de duplicar', async () => {
-    await upsertTrack(db, track('a')); await upsertTrack(db, track('b', { title: 'Otra' }));
-    const pl = await savePlaylist(db, { name: 'Mi lista', spotifyId: 'pl1' }, ['b', 'a']);
-    expect((await getPlaylistEntries(db, pl)).map(e => e.track.id)).toEqual(['b', 'a']);
-    const again = await savePlaylist(db, { name: 'Mi lista 2', spotifyId: 'pl1' }, ['a']);
-    expect(again).toBe(pl);
-    expect(await getPlaylistEntries(db, pl)).toHaveLength(1);
-  });
-});
-
-describe('matching guardado', () => {
-  it('auto: guarda vídeo y alimenta la caché', async () => {
-    const t = track('a'); await upsertTrack(db, t);
-    const st = await recordMatching(db, 'a', [score(t, cand('vid1')), score(t, cand('vidX', { artists: ['Otro'] }))]);
-    expect(st).toBe('auto');
-    expect(await getCachedVideoId(db, 'sp_a')).toBe('vid1');
-  });
-  it('dudoso: queda pendiente con candidatos ordenados y sin caché', async () => {
-    const t = track('a'); await upsertTrack(db, t);
-    const st = await recordMatching(db, 'a', [
-      score(t, cand('v1', { durationMs: undefined })),
-      score(t, cand('v2', { durationMs: 193000 })),
-    ]);
-    expect(st).toBe('pending');
-    expect(await getCachedVideoId(db, 'sp_a')).toBeNull();
-    const [p] = await listPendingReviews(db);
-    expect(p.track.id).toBe('a');
-    expect(p.candidates.map(c => c.score)).toEqual([...p.candidates.map(c => c.score)].sort((x, y) => y - x));
-  });
-  it('sin candidatos válidos: none', async () => {
-    const t = track('a'); await upsertTrack(db, t);
-    expect(await recordMatching(db, 'a', [score(t, cand('v1', { artists: ['Otro'], title: 'Nada' }))])).toBe('none');
-  });
-  it('la decisión manual del usuario nunca se sobrescribe', async () => {
-    const t = track('a'); await upsertTrack(db, t);
-    await recordMatching(db, 'a', [score(t, cand('v1', { durationMs: undefined }))]);
-    await resolveManual(db, 'a', 'elegido');
-    expect(await recordMatching(db, 'a', [score(t, cand('vNuevo'))])).toBe('manual');
-    expect(await getMatchStatus(db, 'a')).toEqual({ status: 'manual', videoId: 'elegido' });
-    expect(await getCachedVideoId(db, 'sp_a')).toBe('elegido');
-    expect(await listPendingReviews(db)).toHaveLength(0);
-  });
-  it('contadores por estado', async () => {
-    const t = track('a'); await upsertTrack(db, t);
-    await recordMatching(db, 'a', [score(t, cand('vid1'))]);
-    expect(await countByStatus(db)).toEqual({ auto: 1 });
-  });
-});
 </file>
 
 <file path="tests/matching-cases.md">
@@ -1764,6 +1893,152 @@ Cada candidato recibe una puntuación y una decisión: `auto`, `review` o `rejec
 }
 </file>
 
+<file path="src/core/player/queue.ts">
+export interface QueueItem {
+  trackId: string;
+  videoId: string;
+  title: string;
+  artists: string[];
+}
+
+interface EntryLike {
+  track: { id: string; title: string; artists: string[] };
+  status: string | null;
+  videoId: string | null;
+}
+
+/** Cola de reproducción: solo canciones con vídeo resuelto (auto o manual), en el orden de la playlist. */
+export function buildQueue(entries: EntryLike[]): QueueItem[] {
+  return entries
+    .filter(e => (e.status === 'auto' || e.status === 'manual') && e.videoId)
+    .map(e => ({ trackId: e.track.id, videoId: e.videoId as string, title: e.track.title, artists: e.track.artists }));
+}
+
+/** Índice siguiente/anterior, o null si se sale de la cola. */
+export function stepIndex(index: number, length: number, dir: 1 | -1): number | null {
+  const n = index + dir;
+  return n >= 0 && n < length ? n : null;
+}
+
+/**
+ * Mezcla la cola (Fisher-Yates). Si se indica `firstTrackId`, esa canción queda
+ * la primera y el resto se mezcla. `random` es inyectable para los tests.
+ */
+export function shuffleQueue(items: QueueItem[], firstTrackId?: string, random: () => number = Math.random): QueueItem[] {
+  const first = firstTrackId ? items.find(i => i.trackId === firstTrackId) : undefined;
+  const rest = items.filter(i => i !== first);
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [rest[i], rest[j]] = [rest[j], rest[i]];
+  }
+  return first ? [first, ...rest] : rest;
+}
+</file>
+
+<file path="src/ui/ReviewScreen.tsx">
+import React, { useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Linking, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Db } from '../db/database';
+import { listPendingReviews, markNone, PendingReview, resolveManual } from '../db/repository';
+import { Btn } from './kit';
+import { colors, radius, type } from './theme';
+
+const fmt = (ms?: number): string => {
+  if (!ms) return '—';
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+export function ReviewScreen({ db, onChanged }: { db: Db; onChanged?: () => void }) {
+  const [items, setItems] = useState<PendingReview[] | null>(null);
+  const [i, setI] = useState(0);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setItems(await listPendingReviews(db));
+    setI(0);
+  }, [db]);
+  useEffect(() => { load(); }, [load]);
+
+  const act = async (fn: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try { await fn(); await load(); onChanged?.(); } finally { setBusy(false); }
+  };
+
+  const cur = items && items.length > 0 ? items[i % items.length] : null;
+
+  return (
+    <ScrollView contentContainerStyle={s.container}>
+      <Text style={type.small}>Coincidencias dudosas</Text>
+      <Text style={type.h1}>Revisar</Text>
+
+      {items === null && <ActivityIndicator color={colors.accent} />}
+      {items && items.length === 0 && (
+        <View style={s.empty}><Text style={type.body}>No queda nada pendiente. Todo en orden.</Text></View>
+      )}
+
+      {cur && items && (
+        <>
+          <Text style={type.small}>{(i % items.length) + 1} de {items.length} pendientes</Text>
+
+          <View style={s.original}>
+            <Text style={s.originalLabel}>EN SPOTIFY</Text>
+            <Text style={s.originalTitle}>{cur.track.title}</Text>
+            <Text style={s.originalMeta}>
+              {cur.track.artists.join(', ')} · {fmt(cur.track.durationMs)}
+              {cur.track.version !== 'studio' ? ` · ${cur.track.version}` : ''}
+            </Text>
+          </View>
+
+          {cur.candidates.slice(0, 3).map(c => {
+            const notes = [...c.conflicts, ...c.warnings];
+            return (
+              <View key={c.externalId} style={s.cand}>
+                <View style={s.candHead}>
+                  <Text style={s.candLabel}>CANDIDATO</Text>
+                  <Text style={s.score}>{Math.round(c.score)} pts</Text>
+                </View>
+                <Text style={s.candTitle}>{c.title}</Text>
+                <Text style={type.body}>{c.artists.join(', ') || 'Artista desconocido'} · {fmt(c.durationMs)}</Text>
+                {c.reasons.length > 0 && <Text style={s.good}>{c.reasons.join(' · ')}</Text>}
+                {notes.length > 0 && <Text style={s.warn}>{notes.join(' · ')}</Text>}
+                <View style={s.row}>
+                  <Btn flex label="Elegir" disabled={busy} onPress={() => act(() => resolveManual(db, cur.track.id, c.externalId))} />
+                  <Btn flex tone="soft" icon="play" label="Escuchar" onPress={() => Linking.openURL(`https://music.youtube.com/watch?v=${c.externalId}`)} />
+                </View>
+              </View>
+            );
+          })}
+
+          <View style={s.row}>
+            <Btn flex tone="soft" label="Ninguno es correcto" disabled={busy} onPress={() => act(() => markNone(db, cur.track.id))} />
+            {items.length > 1 && <Btn flex tone="soft" label="Saltar" onPress={() => setI(n => n + 1)} />}
+          </View>
+        </>
+      )}
+    </ScrollView>
+  );
+}
+
+const s = StyleSheet.create({
+  container: { padding: 24, gap: 14, paddingBottom: 32 },
+  empty: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 18, borderWidth: 1, borderColor: colors.line },
+  original: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 20, gap: 4 },
+  originalLabel: { color: colors.onDarkMuted, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  originalTitle: { color: colors.onDark, fontSize: 24, lineHeight: 29, fontWeight: '800', letterSpacing: -0.5 },
+  originalMeta: { color: colors.onDarkMuted, fontSize: 14 },
+  cand: { backgroundColor: colors.card, borderRadius: radius.lg, padding: 16, gap: 6, borderWidth: 1, borderColor: colors.line },
+  candHead: { flexDirection: 'row', justifyContent: 'space-between' },
+  candLabel: { color: colors.faint, fontSize: 10, letterSpacing: 2, fontWeight: '800' },
+  score: { color: colors.gold, fontSize: 12, fontWeight: '800' },
+  candTitle: { color: colors.text, fontSize: 17, fontWeight: '800', letterSpacing: -0.3 },
+  good: { color: colors.gold, fontSize: 12 },
+  warn: { color: colors.terracotta, fontSize: 12 },
+  row: { flexDirection: 'row', gap: 10, marginTop: 6 },
+});
+</file>
+
 <file path="tests/matchQueue.test.ts">
 import { describe, it, expect } from 'vitest';
 import { Track } from '../src/models/Track';
@@ -1846,6 +2121,44 @@ describe('runMatching', () => {
 });
 </file>
 
+<file path="tests/queue.test.ts">
+import { describe, expect, it } from 'vitest';
+import { buildQueue, shuffleQueue, stepIndex } from '../src/core/player/queue';
+
+const e = (id: string, status: string | null, videoId: string | null) => ({
+  track: { id, title: 'T' + id, artists: ['A'] }, status, videoId,
+});
+
+describe('cola de reproducción', () => {
+  it('solo incluye canciones resueltas, en orden', () => {
+    const q = buildQueue([e('1', 'auto', 'v1'), e('2', 'pending', null), e('3', 'none', null), e('4', 'manual', 'v4'), e('5', 'auto', null)]);
+    expect(q.map(i => i.videoId)).toEqual(['v1', 'v4']);
+    expect(q[1]).toMatchObject({ trackId: '4', title: 'T4', artists: ['A'] });
+  });
+  it('stepIndex respeta los extremos', () => {
+    expect(stepIndex(0, 3, 1)).toBe(1);
+    expect(stepIndex(2, 3, 1)).toBeNull();
+    expect(stepIndex(0, 3, -1)).toBeNull();
+    expect(stepIndex(2, 3, -1)).toBe(1);
+  });
+});
+
+describe('aleatorio', () => {
+  const items = ['1', '2', '3', '4', '5'].map(id => ({ trackId: id, videoId: 'v' + id, title: id, artists: ['A'] }));
+  it('conserva todas las canciones y no modifica la original', () => {
+    const out = shuffleQueue(items, undefined, () => 0.3);
+    expect(out.map(i => i.trackId).sort()).toEqual(['1', '2', '3', '4', '5']);
+    expect(items.map(i => i.trackId)).toEqual(['1', '2', '3', '4', '5']);
+  });
+  it('deja primera la canción indicada', () => {
+    for (const r of [0, 0.5, 0.99]) expect(shuffleQueue(items, '4', () => r)[0].trackId).toBe('4');
+  });
+  it('realmente reordena', () => {
+    expect(shuffleQueue(items, undefined, () => 0).map(i => i.trackId)).not.toEqual(['1', '2', '3', '4', '5']);
+  });
+});
+</file>
+
 <file path="app.json">
 {
   "expo": {
@@ -1881,40 +2194,522 @@ describe('runMatching', () => {
 }
 </file>
 
+<file path="src/db/repository.ts">
+import { Track, TrackCandidate, TrackVersion } from '../models/Track';
+import { MatchResult } from '../core/matching/scoreCandidate';
+import { Db } from './database';
+
+export type MatchStatus = 'auto' | 'manual' | 'pending' | 'none';
+export interface ScoredCandidate { candidate: TrackCandidate; result: MatchResult }
+export interface StoredCandidate extends TrackCandidate { score: number; decision: string; reasons: string[]; conflicts: string[]; warnings: string[] }
+
+const MAX_CANDIDATES = 5;
+const now = () => Date.now();
+export const newId = (): string =>
+  Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+
+interface TrackRow {
+  id: string; spotify_id: string | null; title: string; artists: string; album: string | null;
+  duration_ms: number | null; isrc: string | null; version: string; musicbrainz_id: string | null;
+}
+const toTrack = (r: TrackRow): Track => ({
+  id: r.id, title: r.title, artists: JSON.parse(r.artists) as string[],
+  album: r.album ?? undefined, durationMs: r.duration_ms ?? undefined, isrc: r.isrc ?? undefined,
+  version: r.version as TrackVersion,
+  externalIds: { spotify: r.spotify_id ?? undefined, musicBrainzRecording: r.musicbrainz_id ?? undefined },
+});
+
+/** Inserta la canción o actualiza la existente (clave: id de Spotify). Devuelve el id interno. */
+export async function upsertTrack(db: Db, track: Track): Promise<string> {
+  const spotify = track.externalIds.spotify ?? null;
+  if (spotify) {
+    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE spotify_id = ?', [spotify]);
+    if (existing) {
+      await db.runAsync(
+        'UPDATE tracks SET title=?, artists=?, album=?, duration_ms=?, isrc=?, version=? WHERE id=?',
+        [track.title, JSON.stringify(track.artists), track.album ?? null, track.durationMs ?? null,
+         track.isrc ?? null, track.version, existing.id]);
+      return existing.id;
+    }
+  }
+  await db.runAsync(
+    `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [track.id, spotify, track.title, JSON.stringify(track.artists), track.album ?? null,
+     track.durationMs ?? null, track.isrc ?? null, track.version,
+     track.externalIds.musicBrainzRecording ?? null, now()]);
+  return track.id;
+}
+
+export async function getTrack(db: Db, id: string): Promise<Track | null> {
+  const row = await db.getFirstAsync<TrackRow>('SELECT * FROM tracks WHERE id = ?', [id]);
+  return row ? toTrack(row) : null;
+}
+
+/**
+ * Guarda una playlist y el orden de sus canciones. Reimportar la misma playlist
+ * (mismo spotifyId) la actualiza en vez de duplicarla.
+ */
+export async function savePlaylist(
+  db: Db,
+  playlist: { name: string; spotifyId?: string; sourceUrl?: string },
+  trackIds: string[],
+): Promise<string> {
+  let id: string | undefined;
+  if (playlist.spotifyId) {
+    id = (await db.getFirstAsync<{ id: string }>('SELECT id FROM playlists WHERE spotify_id = ?', [playlist.spotifyId]))?.id;
+  }
+  await db.execAsync('BEGIN');
+  try {
+    if (id) {
+      await db.runAsync('UPDATE playlists SET name=?, source_url=? WHERE id=?', [playlist.name, playlist.sourceUrl ?? null, id]);
+      await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [id]);
+    } else {
+      id = newId();
+      await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,?,?,?,?)',
+        [id, playlist.spotifyId ?? null, playlist.name, playlist.sourceUrl ?? null, now()]);
+    }
+    for (let i = 0; i < trackIds.length; i++) {
+      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, trackIds[i]]);
+    }
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+  return id;
+}
+
+export interface PlaylistEntry { position: number; track: Track; status: MatchStatus | null; videoId: string | null }
+
+export async function getPlaylistEntries(db: Db, playlistId: string): Promise<PlaylistEntry[]> {
+  const rows = await db.getAllAsync<TrackRow & { position: number; m_status: string | null; m_video: string | null }>(
+    `SELECT t.*, pt.position, m.status AS m_status, m.video_id AS m_video
+     FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+     LEFT JOIN matches m ON m.track_id = t.id
+     WHERE pt.playlist_id = ? ORDER BY pt.position`, [playlistId]);
+  return rows.map(r => ({ position: r.position, track: toTrack(r), status: r.m_status as MatchStatus | null, videoId: r.m_video }));
+}
+
+/** Caché: vídeo ya resuelto (auto o manual) para una canción de Spotify. */
+export async function getCachedVideoId(db: Db, spotifyId: string): Promise<string | null> {
+  const row = await db.getFirstAsync<{ video_id: string }>(
+    `SELECT m.video_id FROM matches m JOIN tracks t ON t.id = m.track_id
+     WHERE t.spotify_id = ? AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL`, [spotifyId]);
+  return row?.video_id ?? null;
+}
+
+export async function getMatchStatus(db: Db, trackId: string): Promise<{ status: MatchStatus; videoId: string | null } | null> {
+  const row = await db.getFirstAsync<{ status: string; video_id: string | null }>(
+    'SELECT status, video_id FROM matches WHERE track_id = ?', [trackId]);
+  return row ? { status: row.status as MatchStatus, videoId: row.video_id } : null;
+}
+
+async function setMatch(db: Db, trackId: string, status: MatchStatus, videoId: string | null, score: number | null) {
+  await db.runAsync(
+    `INSERT INTO matches (track_id, video_id, status, score, updated_at) VALUES (?,?,?,?,?)
+     ON CONFLICT(track_id) DO UPDATE SET video_id=excluded.video_id, status=excluded.status,
+       score=excluded.score, updated_at=excluded.updated_at`,
+    [trackId, videoId, status, score, now()]);
+}
+
+/**
+ * Registra el resultado del matching de una canción. Una decisión manual
+ * previa del usuario nunca se sobrescribe.
+ */
+export async function recordMatching(db: Db, trackId: string, scored: ScoredCandidate[]): Promise<MatchStatus> {
+  const current = await getMatchStatus(db, trackId);
+  if (current?.status === 'manual') return 'manual';
+
+  const usable = scored
+    .filter(s => s.result.decision !== 'reject')
+    .sort((a, b) => b.result.score - a.result.score)
+    .slice(0, MAX_CANDIDATES);
+
+  await db.runAsync('DELETE FROM candidates WHERE track_id = ?', [trackId]);
+  for (const { candidate: c, result: r } of usable) {
+    await db.runAsync(
+      `INSERT INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, c.provider, c.externalId, c.title, JSON.stringify(c.artists), c.durationMs ?? null, c.version,
+       r.score, r.decision, JSON.stringify(r.reasons), JSON.stringify(r.conflicts), JSON.stringify(r.warnings)]);
+  }
+
+  const best = usable[0];
+  if (best && best.result.decision === 'auto' && best.candidate.provider === 'youtube') {
+    await setMatch(db, trackId, 'auto', best.candidate.externalId, best.result.score);
+    return 'auto';
+  }
+  if (usable.length > 0) {
+    await setMatch(db, trackId, 'pending', null, best.result.score);
+    return 'pending';
+  }
+  await setMatch(db, trackId, 'none', null, null);
+  return 'none';
+}
+
+/** El usuario elige un vídeo concreto para una canción. */
+export async function resolveManual(db: Db, trackId: string, videoId: string): Promise<void> {
+  await setMatch(db, trackId, 'manual', videoId, null);
+}
+
+export interface PendingReview { track: Track; candidates: StoredCandidate[] }
+
+export async function listPendingReviews(db: Db): Promise<PendingReview[]> {
+  const rows = await db.getAllAsync<TrackRow>(
+    `SELECT t.* FROM tracks t JOIN matches m ON m.track_id = t.id
+     WHERE m.status = 'pending' ORDER BY t.created_at, t.title`);
+  const out: PendingReview[] = [];
+  for (const row of rows) {
+    const cands = await db.getAllAsync<{
+      provider: string; external_id: string; title: string; artists: string; duration_ms: number | null;
+      version: string; score: number; decision: string; reasons: string; conflicts: string; warnings: string;
+    }>('SELECT * FROM candidates WHERE track_id = ? ORDER BY score DESC', [row.id]);
+    out.push({
+      track: toTrack(row),
+      candidates: cands.map(c => ({
+        provider: c.provider as TrackCandidate['provider'], externalId: c.external_id, title: c.title,
+        artists: JSON.parse(c.artists), durationMs: c.duration_ms ?? undefined, version: c.version as TrackVersion,
+        score: c.score, decision: c.decision, reasons: JSON.parse(c.reasons),
+        conflicts: JSON.parse(c.conflicts), warnings: JSON.parse(c.warnings),
+      })),
+    });
+  }
+  return out;
+}
+
+export async function countByStatus(db: Db): Promise<Record<string, number>> {
+  const rows = await db.getAllAsync<{ status: string; n: number }>('SELECT status, COUNT(*) AS n FROM matches GROUP BY status');
+  const out: Record<string, number> = {};
+  for (const r of rows) out[r.status] = r.n;
+  return out;
+}
+
+export interface ChosenVideo { title: string; artists: string[]; durationMs?: number }
+
+/** Vídeo elegido (auto o manual) de cada canción de una playlist, indexado por id de canción. */
+export async function getChosenVideos(db: Db, playlistId: string): Promise<Record<string, ChosenVideo>> {
+  const rows = await db.getAllAsync<{ track_id: string; title: string; artists: string; duration_ms: number | null }>(
+    `SELECT pt.track_id, c.title, c.artists, c.duration_ms
+     FROM playlist_tracks pt
+     JOIN matches m ON m.track_id = pt.track_id AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL
+     JOIN candidates c ON c.track_id = m.track_id AND c.provider = 'youtube' AND c.external_id = m.video_id
+     WHERE pt.playlist_id = ?`, [playlistId]);
+  const out: Record<string, ChosenVideo> = {};
+  for (const r of rows) {
+    out[r.track_id] = { title: r.title, artists: JSON.parse(r.artists) as string[], durationMs: r.duration_ms ?? undefined };
+  }
+  return out;
+}
+
+/** El usuario descarta todos los candidatos de una canción (queda 'none'; una nueva búsqueda puede reintentarla). */
+export async function markNone(db: Db, trackId: string): Promise<void> {
+  await setMatch(db, trackId, 'none', null, null);
+}
+
+export interface PlaylistInfo { id: string; name: string; total: number; resolved: number; pending: number }
+
+/** Playlists guardadas, las más recientes primero, con su progreso de matching. */
+export async function listPlaylists(db: Db): Promise<PlaylistInfo[]> {
+  return db.getAllAsync<PlaylistInfo>(
+    `SELECT p.id AS id, p.name AS name,
+            COUNT(pt.track_id) AS total,
+            COALESCE(SUM(CASE WHEN m.status IN ('auto','manual') THEN 1 ELSE 0 END), 0) AS resolved,
+            COALESCE(SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending
+     FROM playlists p
+     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+     LEFT JOIN matches m ON m.track_id = pt.track_id
+     GROUP BY p.id ORDER BY p.created_at DESC, p.name`);
+}
+
+/**
+ * Borra una playlist y las canciones que ya no están en ninguna otra
+ * (con sus coincidencias y candidatos). Las canciones compartidas se conservan.
+ */
+export async function deletePlaylist(db: Db, playlistId: string): Promise<void> {
+  await db.execAsync('BEGIN');
+  try {
+    await db.runAsync('DELETE FROM playlists WHERE id = ?', [playlistId]);
+    await db.execAsync('DELETE FROM tracks WHERE id NOT IN (SELECT track_id FROM playlist_tracks)');
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}
+</file>
+
+<file path="tests/db.test.ts">
+import { beforeEach, describe, expect, it } from 'vitest';
+import { Db } from '../src/db/database';
+import { migrate, SCHEMA_VERSION } from '../src/db/migrations';
+import {
+  getCachedVideoId, getMatchStatus, getPlaylistEntries, getTrack, listPendingReviews,
+  recordMatching, resolveManual, savePlaylist, upsertTrack, countByStatus, ScoredCandidate,
+  getChosenVideos, markNone, listPlaylists, deletePlaylist,
+} from '../src/db/repository';
+import { scoreCandidate } from '../src/core/matching/scoreCandidate';
+import { Track, TrackCandidate } from '../src/models/Track';
+import { createTestDb } from './helpers/nodeSqliteDb';
+
+const track = (id: string, o: Partial<Track> = {}): Track => ({
+  id, title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'], album: 'Shawn Mendes',
+  durationMs: 190000, version: 'studio', externalIds: { spotify: 'sp_' + id }, ...o,
+});
+const cand = (id: string, o: Partial<TrackCandidate> = {}): TrackCandidate => ({
+  provider: 'youtube', externalId: id, title: 'Señorita', artists: ['Shawn Mendes'],
+  durationMs: 190500, version: 'studio', ...o,
+});
+const score = (t: Track, c: TrackCandidate): ScoredCandidate => ({ candidate: c, result: scoreCandidate(t, c) });
+
+let db: Db;
+beforeEach(async () => { db = createTestDb(); await migrate(db); });
+
+describe('migraciones', () => {
+  it('son idempotentes y fijan la versión', async () => {
+    expect(await migrate(db)).toBe(SCHEMA_VERSION);
+    const v = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
+    expect(v?.user_version).toBe(SCHEMA_VERSION);
+  });
+});
+
+describe('canciones', () => {
+  it('guarda y recupera con artistas como lista', async () => {
+    await upsertTrack(db, track('a'));
+    expect(await getTrack(db, 'a')).toMatchObject({ title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'] });
+  });
+  it('misma canción de Spotify no se duplica y conserva su id', async () => {
+    const id1 = await upsertTrack(db, track('a'));
+    const id2 = await upsertTrack(db, track('b', { externalIds: { spotify: 'sp_a' }, title: 'Señorita (v2)' }));
+    expect(id2).toBe(id1);
+    expect((await getTrack(db, id1))?.title).toBe('Señorita (v2)');
+  });
+});
+
+describe('playlists', () => {
+  it('conserva el orden y reimportar actualiza en vez de duplicar', async () => {
+    await upsertTrack(db, track('a')); await upsertTrack(db, track('b', { title: 'Otra' }));
+    const pl = await savePlaylist(db, { name: 'Mi lista', spotifyId: 'pl1' }, ['b', 'a']);
+    expect((await getPlaylistEntries(db, pl)).map(e => e.track.id)).toEqual(['b', 'a']);
+    const again = await savePlaylist(db, { name: 'Mi lista 2', spotifyId: 'pl1' }, ['a']);
+    expect(again).toBe(pl);
+    expect(await getPlaylistEntries(db, pl)).toHaveLength(1);
+  });
+});
+
+describe('matching guardado', () => {
+  it('auto: guarda vídeo y alimenta la caché', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    const st = await recordMatching(db, 'a', [score(t, cand('vid1')), score(t, cand('vidX', { artists: ['Otro'] }))]);
+    expect(st).toBe('auto');
+    expect(await getCachedVideoId(db, 'sp_a')).toBe('vid1');
+  });
+  it('dudoso: queda pendiente con candidatos ordenados y sin caché', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    const st = await recordMatching(db, 'a', [
+      score(t, cand('v1', { durationMs: undefined })),
+      score(t, cand('v2', { durationMs: 193000 })),
+    ]);
+    expect(st).toBe('pending');
+    expect(await getCachedVideoId(db, 'sp_a')).toBeNull();
+    const [p] = await listPendingReviews(db);
+    expect(p.track.id).toBe('a');
+    expect(p.candidates.map(c => c.score)).toEqual([...p.candidates.map(c => c.score)].sort((x, y) => y - x));
+  });
+  it('sin candidatos válidos: none', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    expect(await recordMatching(db, 'a', [score(t, cand('v1', { artists: ['Otro'], title: 'Nada' }))])).toBe('none');
+  });
+  it('la decisión manual del usuario nunca se sobrescribe', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    await recordMatching(db, 'a', [score(t, cand('v1', { durationMs: undefined }))]);
+    await resolveManual(db, 'a', 'elegido');
+    expect(await recordMatching(db, 'a', [score(t, cand('vNuevo'))])).toBe('manual');
+    expect(await getMatchStatus(db, 'a')).toEqual({ status: 'manual', videoId: 'elegido' });
+    expect(await getCachedVideoId(db, 'sp_a')).toBe('elegido');
+    expect(await listPendingReviews(db)).toHaveLength(0);
+  });
+  it('contadores por estado', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    await recordMatching(db, 'a', [score(t, cand('vid1'))]);
+    expect(await countByStatus(db)).toEqual({ auto: 1 });
+  });
+});
+describe('revisión manual', () => {
+  it('getChosenVideos devuelve el vídeo auto y el elegido a mano', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    const pl = await savePlaylist(db, { name: 'L', spotifyId: 'pl1' }, ['a']);
+    await recordMatching(db, 'a', [score(t, cand('vid1'))]);
+    expect((await getChosenVideos(db, pl)).a).toMatchObject({ title: 'Señorita', artists: ['Shawn Mendes'] });
+
+    const t2 = track('b', { title: 'Otra' }); await upsertTrack(db, t2);
+    const pl2 = await savePlaylist(db, { name: 'L2', spotifyId: 'pl2' }, ['b']);
+    await recordMatching(db, 'b', [score(t2, cand('v1', { title: 'Otra', durationMs: undefined })), score(t2, cand('v2', { title: 'Otra', durationMs: 193000 }))]);
+    expect((await getChosenVideos(db, pl2)).b).toBeUndefined();
+    await resolveManual(db, 'b', 'v2');
+    expect((await getChosenVideos(db, pl2)).b).toMatchObject({ title: 'Otra', durationMs: 193000 });
+  });
+  it('markNone saca la canción de pendientes', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    await recordMatching(db, 'a', [score(t, cand('v1', { durationMs: undefined }))]);
+    expect(await listPendingReviews(db)).toHaveLength(1);
+    await markNone(db, 'a');
+    expect(await listPendingReviews(db)).toHaveLength(0);
+    expect(await getMatchStatus(db, 'a')).toEqual({ status: 'none', videoId: null });
+  });
+});
+
+describe('biblioteca', () => {
+  it('lista playlists con total, resueltas y pendientes', async () => {
+    const a = track('a'); const b = track('b', { title: 'Otra' });
+    await upsertTrack(db, a); await upsertTrack(db, b);
+    await savePlaylist(db, { name: 'L', spotifyId: 'pl1' }, ['a', 'b']);
+    await recordMatching(db, 'a', [score(a, cand('v1'))]);
+    await recordMatching(db, 'b', [score(b, cand('v2', { title: 'Otra', durationMs: undefined }))]);
+    expect(await listPlaylists(db)).toMatchObject([{ name: 'L', total: 2, resolved: 1, pending: 1 }]);
+  });
+  it('borrar elimina las canciones huérfanas pero conserva las compartidas', async () => {
+    const a = track('a'); const b = track('b', { title: 'Otra' });
+    await upsertTrack(db, a); await upsertTrack(db, b);
+    const p1 = await savePlaylist(db, { name: 'L1', spotifyId: 'pl1' }, ['a', 'b']);
+    await savePlaylist(db, { name: 'L2', spotifyId: 'pl2' }, ['a']);
+    await recordMatching(db, 'b', [score(b, cand('v2', { title: 'Otra' }))]);
+    await deletePlaylist(db, p1);
+    expect(await getTrack(db, 'a')).not.toBeNull();
+    expect(await getTrack(db, 'b')).toBeNull();
+    expect(await getMatchStatus(db, 'b')).toBeNull();
+    expect((await listPlaylists(db)).map(p => p.name)).toEqual(['L2']);
+  });
+});
+</file>
+
+<file path="package.json">
+{
+  "name": "music-project",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "dependencies": {
+    "@expo/vector-icons": "^15.0.2",
+    "expo": "~58.0.23",
+    "expo-auth-session": "~58.0.17",
+    "expo-secure-store": "~58.0.2",
+    "expo-sqlite": "~58.0.15",
+    "expo-status-bar": "~58.0.4",
+    "expo-web-browser": "~58.0.7",
+    "react": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-safe-area-context": "~5.11.1",
+    "react-native-webview": "14.0.1",
+    "react-native-youtube-iframe": "^2.4.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "typescript": "~6.0.3",
+    "vitest": "^5.1.0"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "test": "vitest run"
+  },
+  "private": true
+}
+</file>
+
 <file path="App.tsx">
-import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
+import { SearchFn } from './src/core/matching/matchTrack';
+import { buildQueue, QueueItem, shuffleQueue, stepIndex } from './src/core/player/queue';
 import { Db } from './src/db/database';
+import { makeQueueDeps } from './src/db/matchingAdapter';
 import { openDb } from './src/db/openDb';
-import { getPlaylistEntries, PlaylistEntry } from './src/db/repository';
+import {
+  ChosenVideo, countByStatus, deletePlaylist, getChosenVideos, getPlaylistEntries, listPlaylists, PlaylistEntry, PlaylistInfo,
+} from './src/db/repository';
 import { ImportError } from './src/importers/errors';
-import { importSpotifyPlaylist, ImportSummary } from './src/importers/spotify/importPlaylist';
+import { importSpotifyPlaylist } from './src/importers/spotify/importPlaylist';
+import { searchYtMusic } from './src/providers/youtubeMusic/search';
+import { PlaylistCard, TrackRow } from './src/ui/cards';
+import { Btn, Chip, Disc, Icon, IconBtn } from './src/ui/kit';
+import { PlayerDock } from './src/ui/PlayerDock';
+import { ReviewScreen } from './src/ui/ReviewScreen';
+import { Tab, TabBar } from './src/ui/TabBar';
+import { colors, fonts, radius, type } from './src/ui/theme';
+
+const search: SearchFn = (query, opts) => searchYtMusic(query, { filter: opts?.filter });
+
+type LibFilter = 'all' | 'complete' | 'doubts';
+type TrackFilter = 'all' | 'pending' | 'none';
 
 export default function App() {
+  const { width } = useWindowDimensions();
+  const cardW = Math.floor((width - 48 - 12) / 2);
+
   const [db, setDb] = useState<Db | null>(null);
+  const [tab, setTab] = useState<Tab>('library');
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [summary, setSummary] = useState<ImportSummary | null>(null);
+  const [current, setCurrent] = useState<{ playlistId: string; name: string } | null>(null);
+  const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
   const [entries, setEntries] = useState<PlaylistEntry[]>([]);
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [chosen, setChosen] = useState<Record<string, ChosenVideo>>({});
+  const [matching, setMatching] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number; title: string } | null>(null);
+  const [query, setQuery] = useState('');
+  const [showImport, setShowImport] = useState(false);
+  const [libFilter, setLibFilter] = useState<LibFilter>('all');
+  const [trackFilter, setTrackFilter] = useState<TrackFilter>('all');
+  const [base, setBase] = useState<QueueItem[]>([]);
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [nowIdx, setNowIdx] = useState<number | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [shuffle, setShuffle] = useState(false);
+  const [debugOut, setDebugOut] = useState<string | null>(null);
+  const signal = useRef({ aborted: false });
 
   useEffect(() => {
-    openDb().then(setDb).catch(e => setError(`Error de base de datos: ${String(e)}`));
+    openDb()
+      .then(async d => { setDb(d); setCounts(await countByStatus(d)); setPlaylists(await listPlaylists(d)); })
+      .catch(e => setError(`Error de base de datos: ${String(e)}`));
   }, []);
 
+  const refresh = useCallback(async (d: Db, playlistId: string) => {
+    setEntries(await getPlaylistEntries(d, playlistId));
+    setChosen(await getChosenVideos(d, playlistId));
+    setCounts(await countByStatus(d));
+  }, []);
+
+  const goTab = async (t: Tab) => {
+    setTab(t);
+    if (t === 'library' && db) {
+      setPlaylists(await listPlaylists(db));
+      setCounts(await countByStatus(db));
+      if (current) await refresh(db, current.playlistId);
+    }
+  };
+
+  /* ---------- Importar ---------- */
   const onImport = async () => {
     if (!db || busy) return;
     setBusy(true); setError(null); setMessage(null);
     try {
-      const s = await importSpotifyPlaylist(db, url);
-      setSummary(s);
-      setEntries(await getPlaylistEntries(db, s.playlistId));
+      const sum = await importSpotifyPlaylist(db, url);
+      setCurrent({ playlistId: sum.playlistId, name: sum.name });
+      setTrackFilter('all'); setShowImport(false); setUrl('');
+      setPlaylists(await listPlaylists(db));
+      await refresh(db, sum.playlistId);
       setMessage(
-        `${s.total} canciones importadas (${s.newTracks} nuevas).` +
-        (s.skipped ? ` ${s.skipped} omitidas (locales/episodios).` : '') +
-        (s.partial ? ' Aviso: Spotify solo expone las primeras 100; puede haber más en la playlist.' : ''),
+        `${sum.total} canciones importadas (${sum.newTracks} nuevas).` +
+        (sum.skipped ? ` ${sum.skipped} omitidas (locales/episodios).` : '') +
+        (sum.partial ? ' Spotify solo expone las primeras 100; puede haber más en la playlist.' : ''),
       );
     } catch (e) {
       setError(e instanceof ImportError ? e.message : `Error inesperado: ${String(e)}`);
@@ -1923,64 +2718,317 @@ export default function App() {
     }
   };
 
+  /* ---------- Biblioteca ---------- */
+  const openPlaylist = async (p: PlaylistInfo) => {
+    if (!db) return;
+    setCurrent({ playlistId: p.id, name: p.name }); setTrackFilter('all'); setMessage(null); setError(null);
+    await refresh(db, p.id);
+  };
+  const closePlaylist = async () => {
+    setCurrent(null); setMessage(null); setError(null);
+    if (db) { setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db)); }
+  };
+  const askDelete = (p: PlaylistInfo) =>
+    Alert.alert('Borrar playlist', `¿Borrar "${p.name}"? Se perderán también sus coincidencias elegidas.`, [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Borrar', style: 'destructive',
+        onPress: async () => {
+          if (!db) return;
+          await deletePlaylist(db, p.id);
+          setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db));
+          if (current?.playlistId === p.id) setCurrent(null);
+        },
+      },
+    ]);
+
+  /* ---------- Matching ---------- */
+  const onMatch = async () => {
+    if (!db || !current || matching) return;
+    setMatching(true); setError(null); setMessage(null);
+    signal.current = { aborted: false };
+    try {
+      const sum: QueueSummary = await runMatching(
+        entries.map(e => e.track),
+        makeQueueDeps(db, search),
+        { signal: signal.current, onProgress: p => setProgress({ done: p.done, total: p.total, title: p.track.title }) },
+      );
+      await refresh(db, current.playlistId);
+      const parts = [
+        `${sum.auto} automáticas`, `${sum.review} a revisar`, `${sum.none} sin resultado`,
+        sum.skipped ? `${sum.skipped} ya resueltas` : '', sum.errors ? `${sum.errors} errores` : '',
+      ].filter(Boolean);
+      setMessage(`${sum.aborted ? 'Cancelado. ' : ''}Matching: ${parts.join(' · ')}.`);
+      if (sum.stoppedByErrors) setError('Se detuvo por errores seguidos (¿sin conexión o YouTube bloqueando?).');
+    } catch (e) {
+      setError(`Error inesperado: ${String(e)}`);
+    } finally {
+      setMatching(false); setProgress(null);
+    }
+  };
+
+  const onDebug = async () => {
+    setDebugOut('Buscando…');
+    try {
+      const r = await searchYtMusic('The Weeknd Blinding Lights');
+      setDebugOut(JSON.stringify(r.slice(0, 3), null, 1));
+    } catch (e) {
+      setDebugOut(`Error: ${String(e)}`);
+    }
+  };
+
+  /* ---------- Reproductor ---------- */
+  const startAt = (trackId?: string, forceShuffle?: boolean) => {
+    const b = buildQueue(entries);
+    if (b.length === 0) return;
+    const shuf = forceShuffle ?? shuffle;
+    setShuffle(shuf); setBase(b);
+    if (shuf) { setQueue(shuffleQueue(b, trackId)); setNowIdx(0); }
+    else { setQueue(b); setNowIdx(trackId ? Math.max(0, b.findIndex(i => i.trackId === trackId)) : 0); }
+    setPlaying(true);
+  };
+  const step = (dir: 1 | -1) => {
+    if (nowIdx === null) return;
+    const n = stepIndex(nowIdx, queue.length, dir);
+    if (n === null) { if (dir === 1) { setNowIdx(null); setPlaying(false); } return; }
+    setNowIdx(n); setPlaying(true);
+  };
+  const toggleShuffle = () => {
+    if (nowIdx === null) { setShuffle(v => !v); return; }
+    const cur = queue[nowIdx];
+    if (!shuffle) { setQueue(shuffleQueue(base, cur.trackId)); setNowIdx(0); }
+    else { setQueue(base); setNowIdx(Math.max(0, base.findIndex(i => i.trackId === cur.trackId))); }
+    setShuffle(!shuffle);
+  };
+  const onPlayerError = () => {
+    const cur = nowIdx !== null ? queue[nowIdx] : null;
+    setError(`No se pudo reproducir "${cur?.title ?? ''}" (puede no permitir reproducción embebida). Pasando a la siguiente.`);
+    step(1);
+  };
+
+  /* ---------- Datos derivados ---------- */
+  const nowTrackId = nowIdx !== null ? queue[nowIdx]?.trackId : undefined;
+  const nOf = (st: string) => entries.filter(e => e.status === st).length;
+  const ready = nOf('auto') + nOf('manual');
+  const pending = nOf('pending');
+  const none = nOf('none');
+  const hasPlayable = entries.some(e => e.videoId);
+  const currentInfo = current ? playlists.find(p => p.id === current.playlistId) : undefined;
+
+  const visiblePlaylists = playlists.filter(p => {
+    if (query.trim() && !p.name.toLowerCase().includes(query.trim().toLowerCase())) return false;
+    if (libFilter === 'complete') return p.total > 0 && p.resolved === p.total;
+    if (libFilter === 'doubts') return p.pending > 0;
+    return true;
+  });
+  const visibleEntries = entries.filter(e => trackFilter === 'all' || e.status === trackFilter);
+
+  const notices = (
+    <>
+      {message && <View style={s.notice}><Text style={s.noticeText}>{message}</Text></View>}
+      {error && <View style={[s.notice, { backgroundColor: colors.dangerBg }]}><Text style={[s.noticeText, { color: colors.danger }]}>{error}</Text></View>}
+    </>
+  );
+
+  /* ---------- Vistas ---------- */
+  const library = (
+    <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
+      <View style={s.topRow}>
+        <IconBtn name="musical-notes" tone="dark" onPress={() => {}} disabled={false} />
+        <Text style={type.small}>{playlists.length} {playlists.length === 1 ? 'playlist' : 'playlists'}</Text>
+      </View>
+      <Text style={type.h1}>Tu música,{'\n'}siempre a mano</Text>
+
+      <View style={s.searchRow}>
+        <View style={s.search}>
+          <Icon name="search" size={18} color={colors.faint} />
+          <TextInput
+            style={s.searchInput} value={query} onChangeText={setQuery}
+            placeholder="Buscar playlist…" placeholderTextColor={colors.faint} autoCorrect={false}
+          />
+        </View>
+        <IconBtn name={showImport ? 'close' : 'add'} tone="accent" size={48} iconSize={22} onPress={() => setShowImport(v => !v)} />
+      </View>
+
+      {(showImport || playlists.length === 0) && (
+        <View style={s.banner}>
+          <View style={s.bannerTop}>
+            <View style={{ flex: 1, gap: 6 }}>
+              <Text style={s.bannerKicker}>Spotify</Text>
+              <Text style={s.bannerTitle}>Importa una playlist</Text>
+              <Text style={s.bannerBody}>Pega el enlace de una playlist pública.</Text>
+            </View>
+            <Disc seed="importar" size={84} />
+          </View>
+          <TextInput
+            style={s.bannerField} value={url} onChangeText={setUrl}
+            placeholder="https://open.spotify.com/playlist/…" placeholderTextColor={colors.onDarkMuted}
+            autoCapitalize="none" autoCorrect={false} keyboardType="url"
+          />
+          <Btn tone="light" label="Importar" onPress={onImport} busy={busy} disabled={!db || matching || !url.trim()} />
+        </View>
+      )}
+
+      {notices}
+
+      <View style={s.sectionHead}>
+        <Text style={type.h2}>Tus playlists</Text>
+        <Text style={type.small}>{visiblePlaylists.length} de {playlists.length}</Text>
+      </View>
+      <View style={s.chips}>
+        <Chip label="Todas" selected={libFilter === 'all'} onPress={() => setLibFilter('all')} />
+        <Chip label="Completas" selected={libFilter === 'complete'} onPress={() => setLibFilter('complete')} />
+        <Chip label="Con dudosas" selected={libFilter === 'doubts'} onPress={() => setLibFilter('doubts')} />
+      </View>
+
+      {playlists.length > 0 && visiblePlaylists.length === 0 && <Text style={type.body}>Ninguna playlist coincide.</Text>}
+      <View style={s.grid}>
+        {visiblePlaylists.map(p => (
+          <PlaylistCard key={p.id} info={p} width={cardW} onPress={() => openPlaylist(p)} onDelete={() => askDelete(p)} />
+        ))}
+      </View>
+
+      <Btn tone="soft" label="Diagnóstico de YouTube Music" onPress={onDebug} />
+      {debugOut && <Text style={s.mono}>{debugOut}</Text>}
+    </ScrollView>
+  );
+
+  const detail = current && (
+    <ScrollView contentContainerStyle={s.container} keyboardShouldPersistTaps="handled">
+      <View style={s.detailBar}>
+        <IconBtn name="chevron-back" onPress={closePlaylist} />
+        <Text style={s.detailBarTitle}>Playlist</Text>
+        <IconBtn name="trash-outline" onPress={() => currentInfo && askDelete(currentInfo)} disabled={!currentInfo} />
+      </View>
+
+      <View style={s.stage}><Disc seed={current.name} size={150} /></View>
+
+      <View style={s.nameRow}>
+        <View style={{ flex: 1, gap: 4 }}>
+          <Text style={s.detailName} numberOfLines={2}>{current.name}</Text>
+          <Text style={type.small}>{entries.length} canciones · {pending} dudosas · {none} sin resultado</Text>
+        </View>
+        <View style={{ alignItems: 'flex-end' }}>
+          <Text style={s.big}>{ready}<Text style={s.bigMuted}>/{entries.length}</Text></Text>
+          <Text style={type.small}>listas</Text>
+        </View>
+      </View>
+
+      <View style={s.chips}>
+        <Chip tone="dark" label="Todas" selected={trackFilter === 'all'} onPress={() => setTrackFilter('all')} />
+        <Chip tone="dark" label={`Dudosas${pending ? ` (${pending})` : ''}`} selected={trackFilter === 'pending'} onPress={() => setTrackFilter('pending')} />
+        <Chip tone="dark" label="Sin resultado" selected={trackFilter === 'none'} onPress={() => setTrackFilter('none')} />
+      </View>
+
+      {matching ? (
+        <View style={s.panel}>
+          <Text style={type.small} numberOfLines={1}>
+            {progress ? `Buscando ${progress.done}/${progress.total} · ${progress.title}` : 'Iniciando…'}
+          </Text>
+          <View style={s.bar}><View style={[s.barFill, { width: `${progress ? Math.round((progress.done / progress.total) * 100) : 0}%` }]} /></View>
+          <Btn tone="soft" label="Cancelar" onPress={() => { signal.current.aborted = true; }} />
+        </View>
+      ) : (
+        <View style={s.row}>
+          <Btn flex tone="soft" icon="search" label="Buscar coincidencias" onPress={onMatch} disabled={busy} />
+          {pending > 0 && <Btn flex tone="soft" icon="checkmark-done" label={`Revisar (${pending})`} onPress={() => goTab('review')} />}
+        </View>
+      )}
+
+      {notices}
+
+      <View style={{ gap: 8 }}>
+        {visibleEntries.length === 0 && <Text style={type.body}>No hay canciones en este filtro.</Text>}
+        {visibleEntries.map(e => {
+          const v = chosen[e.track.id];
+          return (
+            <TrackRow
+              key={e.position} index={e.position + 1} title={e.track.title} artists={e.track.artists.join(', ')}
+              videoCaption={v ? `↳ ${v.title} — ${v.artists.join(', ')}` : undefined}
+              status={e.status} isNow={e.track.id === nowTrackId} playable={!!v}
+              onPress={() => startAt(e.track.id)}
+            />
+          );
+        })}
+      </View>
+    </ScrollView>
+  );
+
   return (
     <SafeAreaProvider>
-      <SafeAreaView style={styles.safe}>
-        <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-          <Text style={styles.eyebrow}>PROYECTO PRIVADO · V0.4</Text>
-          <Text style={styles.title}>Importar playlist</Text>
-          <View style={styles.card}>
-            <Text style={styles.body}>Pega el enlace de una playlist pública de Spotify.</Text>
-            <TextInput
-              style={styles.input} value={url} onChangeText={setUrl} placeholder="https://open.spotify.com/playlist/…"
-              placeholderTextColor="#5B6678" autoCapitalize="none" autoCorrect={false} keyboardType="url"
-            />
-            <Pressable style={[styles.button, (!db || busy || !url.trim()) && styles.buttonOff]} onPress={onImport}
-              disabled={!db || busy || !url.trim()}>
-              {busy ? <ActivityIndicator color="#0B0D12" /> : <Text style={styles.buttonText}>Importar</Text>}
-            </Pressable>
-            {message && <Text style={styles.ok}>{message}</Text>}
-            {error && <Text style={styles.err}>{error}</Text>}
-          </View>
+      <SafeAreaView style={s.safe}>
+        {tab === 'review' && db
+          ? <ReviewScreen db={db} onChanged={() => countByStatus(db).then(setCounts)} />
+          : (current ? detail : library)}
 
-          {summary && (
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>{summary.name}</Text>
-              {entries.slice(0, 15).map(e => (
-                <Text key={e.position} style={styles.body} numberOfLines={1}>
-                  {e.position + 1}. {e.track.title} — {e.track.artists.join(', ')}
-                </Text>
-              ))}
-              {entries.length > 15 && <Text style={styles.body}>… y {entries.length - 15} más</Text>}
-            </View>
-          )}
-        </ScrollView>
+        {tab === 'library' && current && hasPlayable && (
+          <View style={s.actionBar}>
+            <Btn flex label="Reproducir" icon="play" onPress={() => startAt(undefined, false)} />
+            <IconBtn name="shuffle" tone="dark" size={52} onPress={() => startAt(undefined, true)} />
+          </View>
+        )}
+
+        {nowIdx !== null && queue[nowIdx] && (
+          <PlayerDock
+            item={queue[nowIdx]} playing={playing} shuffle={shuffle}
+            onToggle={() => setPlaying(p => !p)} onNext={() => step(1)} onPrev={() => step(-1)}
+            onClose={() => { setNowIdx(null); setPlaying(false); }}
+            onToggleShuffle={toggleShuffle} onEnded={() => step(1)} onError={onPlayerError} onPlayingChange={setPlaying}
+          />
+        )}
+
+        <TabBar tab={tab} onChange={goTab} pending={counts.pending ?? 0} />
       </SafeAreaView>
     </SafeAreaProvider>
   );
 }
 
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: '#0B0D12' },
-  container: { padding: 24, paddingTop: 24, gap: 18 },
-  eyebrow: { color: '#8D9AAF', fontSize: 11, letterSpacing: 2, fontWeight: '700' },
-  title: { color: '#FFFFFF', fontSize: 34, lineHeight: 40, fontWeight: '800' },
-  card: { backgroundColor: '#171C26', borderRadius: 18, padding: 18, gap: 12 },
-  cardTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700' },
-  body: { color: '#B6C0D0', fontSize: 14, lineHeight: 21 },
-  input: { backgroundColor: '#0B0D12', color: '#FFFFFF', borderRadius: 12, padding: 12, fontSize: 14 },
-  button: { backgroundColor: '#70D6A4', borderRadius: 12, padding: 14, alignItems: 'center' },
-  buttonOff: { opacity: 0.4 },
-  buttonText: { color: '#0B0D12', fontWeight: '800', fontSize: 15 },
-  ok: { color: '#70D6A4', fontSize: 13, fontWeight: '600' },
-  err: { color: '#FF8A8A', fontSize: 13, fontWeight: '600' },
+const s = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: colors.bg },
+  container: { padding: 24, paddingBottom: 28, gap: 16 },
+  topRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  row: { flexDirection: 'row', gap: 10 },
+  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  /* buscador */
+  searchRow: { flexDirection: 'row', gap: 10 },
+  search: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, height: 48, paddingHorizontal: 14,
+    backgroundColor: colors.chip, borderRadius: radius.md,
+  },
+  searchInput: { flex: 1, color: colors.text, fontSize: 15 },
+  /* banner de importación */
+  banner: { backgroundColor: colors.dark, borderRadius: radius.xl, padding: 20, gap: 14 },
+  bannerTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  bannerKicker: { color: colors.gold, fontSize: 12, fontWeight: '800', letterSpacing: 0.5 },
+  bannerTitle: { color: colors.onDark, fontSize: 22, lineHeight: 26, fontWeight: '800', letterSpacing: -0.5 },
+  bannerBody: { color: colors.onDarkMuted, fontSize: 13 },
+  bannerField: { backgroundColor: colors.onDarkLine, color: colors.onDark, borderRadius: radius.sm, paddingHorizontal: 14, paddingVertical: 13, fontSize: 14 },
+  /* avisos */
+  notice: { backgroundColor: colors.chip, borderRadius: radius.md, padding: 14 },
+  noticeText: { color: colors.text, fontSize: 13, lineHeight: 19 },
+  /* biblioteca */
+  sectionHead: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
+  mono: { color: colors.muted, fontSize: 11, fontFamily: fonts.mono },
+  /* detalle */
+  detailBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  detailBarTitle: { color: colors.text, fontSize: 16, fontWeight: '700' },
+  stage: { backgroundColor: colors.chip, borderRadius: radius.xl, height: 210, alignItems: 'center', justifyContent: 'center' },
+  nameRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  detailName: { color: colors.text, fontSize: 24, lineHeight: 28, fontWeight: '800', letterSpacing: -0.6 },
+  big: { color: colors.text, fontSize: 26, fontWeight: '800', letterSpacing: -0.6 },
+  bigMuted: { color: colors.faint, fontSize: 16, fontWeight: '700' },
+  panel: { gap: 10, backgroundColor: colors.card, borderRadius: radius.lg, padding: 16, borderWidth: 1, borderColor: colors.line },
+  bar: { height: 6, borderRadius: 3, backgroundColor: colors.chip, overflow: 'hidden' },
+  barFill: { height: 6, backgroundColor: colors.accent },
+  actionBar: { flexDirection: 'row', gap: 10, paddingHorizontal: 24, paddingTop: 10 },
 });
 </file>
 
 <file path="CONTEXT.md">
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 4** (importador Spotify). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **rediseño de UI v2 (paso 9)** y botón aleatorio. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -2005,7 +3053,7 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 ## Decisiones tomadas
 - **Entrega de archivos:** se entregó UN zip final (sin carpeta raíz, sin package.json/app.json/tsconfig.json/App.tsx/assets, que son los generados por Expo del usuario) para volcar el contenido en su carpeta. Desde ahí, solo archivos sueltos con ruta exacta. Antes de eso: NO dar zips (el usuario no quiere sustituir su carpeta). Dar solo archivos nuevos/modificados con su ruta exacta. Su carpeta local es la generada por `create-expo-app` (tiene assets/, node_modules/, AGENTS.md, package.json, tsconfig.json, app.json, index.ts, App.tsx propios, .gitignore, LICENSE). **Nunca pedirle sobrescribir** package.json, tsconfig.json, app.json ni App.tsx: indicar cambios puntuales (p. ej. añadir plugins a app.json).
 - Uso personal: el usuario autoriza **saltarse la regla "solo integraciones oficiales"** del README (búsqueda en YouTube por vías no oficiales, p. ej. ytmusicapi/youtubei). Motivo: `search.list` oficial cuesta 100 uds y la cuota diaria es 10.000 (~100 búsquedas/día; una playlist de 200 no cabe; **verificar en docs actuales**).
-- Reproducción: pendiente de decidir (iframe embebido oficial vs. otras vías). No se ha implementado nada.
+- Reproducción: DECIDIDO empezar con el iframe oficial (menos frágil); el usuario quiere poder cambiar luego a una vía no oficial con segundo plano. Por eso solo `src/ui/YouTubePlayer.tsx` conoce el motor. No se pudo confirmar qué usa Demus (búsqueda sin resultado).
 - El usuario pidió que el README se entregue **como texto en el chat**, no en archivo (el README del zip puede estar desactualizado).
 - Estilo de trabajo: implementar **paso a paso**, respuestas cortas, y devolver este CONTEXT.md actualizado en cada respuesta.
 
@@ -2039,9 +3087,11 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 ## Plan de pasos
 1–4. ✅ (matching, parseo, SQLite, importador Spotify)
 5a. ✅ Búsqueda YT Music (`src/providers/youtubeMusic/search.ts`; NO verificado contra red real)
-5b. ✅ (lógica; 60 tests OK, tsc OK; test de pausas corregido a [100]) `toCandidate`, `findCandidates`, `runMatching` (cola con pausas). ⏭ Falta enlazar con `repository.recordMatching` y botón en App.tsx (necesita ver repository.ts y App.tsx)
-6. Pantalla de revisión (2-3 mejores candidatos por canción dudosa)
-7. Reproductor
+5b. ✅ (lógica; 60 tests OK, tsc OK; test de pausas corregido a [100]) `toCandidate`, `findCandidates`, `runMatching` (cola con pausas). ✅ enlazado en 5c
+5c. ✅ Enlace BD + botón en App.tsx
+6. ✅ Pantalla de revisión
+7. ✅ Reproductor v1 (iframe oficial; sin segundo plano)
+8. ✅ Biblioteca de playlists
 
 ## Pasos 5a/5b — Búsqueda YouTube Music y cola de matching
 - Endpoint interno POST music.youtube.com/youtubei/v1/search (WEB_REMIX, sin cuota). `SONGS_FILTER` de ytmusicapi no verificado: si no devuelve nada, `findCandidates` reintenta con `filter:false` y descarta kind 'other'.
@@ -2050,47 +3100,48 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - `runMatching(tracks, {search, record, shouldSkip, sleep, random}, {delayMs=800 + hasta 50 %, maxConsecutiveErrors=5, onProgress, signal})` → resumen. `record` se adapta a `recordMatching` (formato de `scored` por confirmar con repository.ts).
 - Entrega: el usuario recibe archivos completos con ruta y los sustituye; no pegar fragmentos.
 
-## Siguiente sesión — Paso 5c (enlazar BD + UI)
-- Pedir al usuario que pegue `src/db/repository.ts` y su `App.tsx` actual (no los tengo; no adivinar firmas).
-- Entregar como ARCHIVOS completos: `repository.ts`/adaptador (`record` → `recordMatching`, `shouldSkip` → `getMatchStatus`/`getCachedVideoId`) y `App.tsx` con botón "Buscar coincidencias" (usa `runMatching`, `searchYtMusic`, progreso y cancelación). Opcional: botón de prueba para ver qué devuelve YT Music real y verificar `SONGS_FILTER`.
-- Luego paso 6 (pantalla de revisión) y 7 (reproductor).
-- Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project` (en la carpeta padre npx descarga un `tsc` falso).
+## Paso 5c — Enlace BD + UI (hecho; sin ejecutar en este entorno, NO verificado en dispositivo)
+- `src/db/matchingAdapter.ts`: `makeQueueDeps(db, search)` → `QueueDeps` (`record` → `recordMatching`; `shouldSkip` = estado auto/manual/pending; las `none` se reintentan).
+- `App.tsx` V0.5: importar → botón "Buscar coincidencias" (progreso, cancelar, contadores ✅auto 👆manual ❓pending ✖️none, icono por canción) + botón "Probar YT Music" que muestra el JSON parseado de una búsqueda real (sirve para verificar `SONGS_FILTER`).
+- **Pendiente del usuario:** `npx tsc --noEmit` y `npx vitest run` en su carpeta; probar en iPhone y reportar qué sale en "Probar YT Music" y el resumen del matching.
+
+## Paso 6 — Pantalla de revisión (hecho; NO ejecutado en este entorno)
+- `repository.ts`: nuevas `getChosenVideos(db, playlistId)` (vídeo auto/manual por canción, vía join con `candidates`) y `markNone(db, trackId)` ("ninguno es correcto"; una nueva búsqueda puede reintentarla). Tests añadidos en `tests/db.test.ts` (debería ser 62).
+- `src/ui/ReviewScreen.tsx`: una canción pendiente cada vez, hasta 3 candidatos (título, artistas, duración, puntos, motivos/avisos), botones Elegir (→ `resolveManual`), Escuchar (abre YT Music), Ninguno es correcto, Saltar.
+- `App.tsx` V0.6: cada fila muestra "↳ vídeo elegido"; botón "Revisar dudosas (N)" si hay pendientes; contadores cargados al abrir la BD.
+- La playlist de prueba del usuario salió toda ✅, así que la pantalla de revisión aún no se ha visto con datos reales.
+
+## Paso 7 — Reproductor v1 (hecho; el usuario confirmó que todo funciona en su iPhone)
+- Dependencias nuevas: `npx expo install react-native-webview` y `npm i react-native-youtube-iframe`.
+- `src/core/player/queue.ts` (`buildQueue`, `stepIndex`; `tests/queue.test.ts`, 2 tests), `src/ui/YouTubePlayer.tsx` (único acoplado a react-native-youtube-iframe; props videoId/playing/onEnded/onError/onPlayingChange), `App.tsx` V0.7: "▶ Reproducir playlist", tocar una canción con vídeo la reproduce, barra con ⏮ ⏯ ⏭ ✕, siguiente automático al terminar, salta si el vídeo no es embebible.
+- Limitaciones: se pausa con la pantalla bloqueada/app en segundo plano (WebView); el reproductor se detiene al entrar en la pantalla de revisión. Fase siguiente posible: segundo plano (dev build + modo audio, o motor no oficial reescribiendo solo YouTubePlayer).
+
+## Estado verificado (9-nov-2026)
+- El usuario confirmó que funcionan: importación de Spotify, búsqueda en YT Music, matching (su playlist de prueba salió toda ✅), pantalla de revisión (sin datos dudosos para probarla aún) y reproductor.
+- **GitHub:** el repo github.com/Eriicmans/music-project ya está reconectado y tiene TODO el código subido hasta el paso 7 (se cierra el pendiente de "reconectar con GitHub"). Se trabaja con el repo/repomix que sube el usuario.
+- **Datos:** las playlists y coincidencias viven en la SQLite local de la app (`music.db`) en el iPhone, no en el PC ni en GitHub. Se pierden si se desinstala la app.
+
+## Paso 8 — Biblioteca de playlists (hecho; NO ejecutado en este entorno)
+- `repository.ts`: `listPlaylists` (total/resueltas/pendientes) y `deletePlaylist` (borra la playlist y las canciones huérfanas con sus coincidencias; conserva las compartidas). 2 tests nuevos en `tests/db.test.ts`.
+- `App.tsx` V0.8: la home muestra "Tus playlists" (tocar abre, 🗑 borra con confirmación); dentro, "← Playlists" vuelve. El estado `summary` se sustituyó por `current`. "Revisar dudosas" aparece en la lista y en la playlist abierta.
+
+## Paso 9 — Rediseño visual (v2, estilo "app de muebles" de la referencia del usuario) + aleatorio (NO ejecutado en este entorno)
+- El usuario envió una imagen de referencia (app de muebles: fondo claro, tarjetas muy redondeadas, botones/chips en marrón óxido, tarjetas y barra inferior oscuras como contraste, cabecera con botones cuadrados redondeados, buscador + botón de filtros, tipografía sans geométrica, barra de pestañas flotante con iconos, botón de acción grande abajo) y pidió "algo así". Versiones anteriores descartadas: oscuro/serif (parecía filtro sepia) y claro/serif.
+- Paleta (`src/ui/theme.ts`): fondo crema #F4EFE6, tarjetas #FBF9F5, chips #E8E0D2, marrón oscuro #523D2C (superficies de contraste: banner, tarjetas, reproductor, tab bar), **óxido #9A5A3A (acción: botones, chip activo)**, texto #33261B, dorado #B98B4E (manual), terracota #C0562F (dudosas/badge). Sin verde. Tipografía: sans del sistema (800 en títulos). Radios 12/16/20/26.
+- **Dependencia nueva: `@expo/vector-icons`** (`npx expo install @expo/vector-icons`; se usa Ionicons vía `Icon` en `kit.tsx`). Si da error de nombre de icono, cambiar el nombre en el sitio de uso.
+- Archivos: `src/ui/theme.ts`, `kit.tsx` (Icon, IconBtn, Btn tones accent/dark/soft/light, Chip, Disc, StatusDot), `cards.tsx` (PlaylistCard, TrackRow), `TabBar.tsx` (píldora flotante: Biblioteca / Revisar con badge de pendientes), `PlayerDock.tsx` (tarjeta marrón con vídeo y controles, siempre montada, ya no se corta al cambiar de pestaña), `ReviewScreen.tsx` (ahora es una pestaña; prop `onChanged`), `App.tsx` V1.0.
+- Home "Tu música, siempre a mano": buscador de playlists (filtra por nombre) + botón óxido "+" que muestra/oculta el banner marrón de importación (visible siempre si no hay playlists); chips Todas/Completas/Con dudosas; cuadrícula 2 columnas de tarjetas (disco + franja marrón con nombre y botón borrar). Detalle: cabecera con atrás/borrar, disco grande, nombre + "listas/total" a lo grande, chips Todas/Dudosas/Sin resultado (filtran la lista), Buscar coincidencias con barra de progreso, filas de canción con estado y vídeo elegido, y barra fija inferior "Reproducir" + botón cuadrado aleatorio.
+- Aleatorio: `shuffleQueue` en `queue.ts` (tests incluidos); botón en la barra de la playlist y en el reproductor (activar/desactivar en marcha conserva la canción actual; la cola original está en `base`).
+
+## Siguiente sesión (orden recomendado)
+- **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).
+- Verificado por el usuario: paso 8 (biblioteca) funciona.
+- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) búsqueda manual para corregir una canción mal asignada o sin resultado (✖️); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
+- Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project`.
 
 ## Pendiente de preguntar / decidir
 - Método de reproducción en iOS (afecta a segundo plano).
 - Si hay que tocar `README.md`, `app.json` (projectId EAS) o añadir `package.json` al repo.
-</file>
-
-<file path="package.json">
-{
-  "name": "music-project",
-  "version": "1.0.0",
-  "main": "index.ts",
-  "dependencies": {
-    "expo": "~58.0.23",
-    "expo-auth-session": "~58.0.17",
-    "expo-secure-store": "~58.0.2",
-    "expo-sqlite": "~58.0.15",
-    "expo-status-bar": "~58.0.4",
-    "expo-web-browser": "~58.0.7",
-    "react": "19.3.0",
-    "react-native": "0.88.1",
-    "react-native-safe-area-context": "~5.11.1"
-  },
-  "devDependencies": {
-    "@types/react": "~19.3.0",
-    "typescript": "~6.0.3",
-    "vitest": "^5.1.0"
-  },
-  "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web",
-    "test": "vitest run"
-  },
-  "private": true
-}
 </file>
 
 </files>

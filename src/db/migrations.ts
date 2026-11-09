@@ -53,6 +53,11 @@ const MIGRATIONS: string[][] = [
     `CREATE INDEX idx_matches_status ON matches(status)`,
     `CREATE INDEX idx_playlist_tracks_track ON playlist_tracks(track_id)`,
   ],
+  // v2: canciones añadidas desde la búsqueda (sin id de Spotify, identificadas por su vídeo de YouTube).
+  [
+    `ALTER TABLE tracks ADD COLUMN youtube_id TEXT`,
+    `CREATE UNIQUE INDEX idx_tracks_youtube ON tracks(youtube_id) WHERE youtube_id IS NOT NULL`,
+  ],
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

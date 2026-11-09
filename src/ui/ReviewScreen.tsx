@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Linking, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { SearchFn } from '../core/matching/matchTrack';
 import { Db } from '../db/database';
 import { listPendingReviews, markNone, PendingReview, resolveManual } from '../db/repository';
 import { Btn } from './kit';
+import { ManualSearch } from './ManualSearch';
 import { colors, radius, type } from './theme';
 
 const fmt = (ms?: number): string => {
@@ -11,10 +13,11 @@ const fmt = (ms?: number): string => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
-export function ReviewScreen({ db, onChanged }: { db: Db; onChanged?: () => void }) {
+export function ReviewScreen({ db, search, onChanged }: { db: Db; search: SearchFn; onChanged?: () => void }) {
   const [items, setItems] = useState<PendingReview[] | null>(null);
   const [i, setI] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [manual, setManual] = useState(false);
 
   const load = useCallback(async () => {
     setItems(await listPendingReviews(db));
@@ -73,11 +76,20 @@ export function ReviewScreen({ db, onChanged }: { db: Db; onChanged?: () => void
             );
           })}
 
+          <Btn tone="dark" icon="search" label="Buscar manualmente" disabled={busy} onPress={() => setManual(true)} />
           <View style={s.row}>
             <Btn flex tone="soft" label="Ninguno es correcto" disabled={busy} onPress={() => act(() => markNone(db, cur.track.id))} />
             {items.length > 1 && <Btn flex tone="soft" label="Saltar" onPress={() => setI(n => n + 1)} />}
           </View>
         </>
+      )}
+
+      {manual && cur && (
+        <ManualSearch
+          db={db} track={cur.track} search={search}
+          onClose={() => setManual(false)}
+          onPicked={() => { setManual(false); load().then(() => onChanged?.()); }}
+        />
       )}
     </ScrollView>
   );

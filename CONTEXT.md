@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **rediseño de UI v2 (paso 9)** y botón aleatorio. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras la **pestaña Buscar y añadir a playlist (paso 11)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -105,10 +105,26 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - Home "Tu música, siempre a mano": buscador de playlists (filtra por nombre) + botón óxido "+" que muestra/oculta el banner marrón de importación (visible siempre si no hay playlists); chips Todas/Completas/Con dudosas; cuadrícula 2 columnas de tarjetas (disco + franja marrón con nombre y botón borrar). Detalle: cabecera con atrás/borrar, disco grande, nombre + "listas/total" a lo grande, chips Todas/Dudosas/Sin resultado (filtran la lista), Buscar coincidencias con barra de progreso, filas de canción con estado y vídeo elegido, y barra fija inferior "Reproducir" + botón cuadrado aleatorio.
 - Aleatorio: `shuffleQueue` en `queue.ts` (tests incluidos); botón en la barra de la playlist y en el reproductor (activar/desactivar en marcha conserva la canción actual; la cola original está en `base`).
 
+## Paso 10 — Búsqueda manual (hecho; 67 tests OK en sandbox; UI NO ejecutada ni comprobada con tsc fuera del núcleo)
+- Sirve para corregir una canción mal asignada o sin resultado: el usuario busca en YT Music y elige el vídeo exacto (queda `manual`, nunca lo pisa un nuevo matching).
+- `src/core/matching/manualSearch.ts`: `defaultManualQuery(track)`, `searchManual(track, query, search)` (une búsqueda "Canciones" + sin filtro, sin duplicados, descarta kind 'other', puntúa contra la canción solo como orientación, ordena por score, máx. 15; si falla una búsqueda usa la otra; si fallan ambas lanza).
+- `repository.ts`: `resolveManualFromSearch(db, trackId, candidate, result)` (transacción: INSERT OR REPLACE en `candidates` + match manual; necesario porque `getChosenVideos` hace join con `candidates`).
+- `src/ui/ManualSearch.tsx`: Modal pageSheet con la canción original, campo de búsqueda (precargado "artista título", busca al abrir), resultados con tipo CANCIÓN/VÍDEO, puntos, motivos/avisos, Elegir / Escuchar; marca "Elegida" el vídeo actual.
+- Puntos de entrada: icono lupa en cada `TrackRow` de la playlist (`onSearch`) y botón "Buscar manualmente" en `ReviewScreen` (nueva prop `search`).
+- `tests/manualSearch.test.ts` (10 tests). Total esperado: 67.
+
+## Paso 11 — Pestaña Buscar + añadir a playlist (hecho; 76 tests OK en sandbox; UI NO ejecutada)
+- **Migración v2** (`SCHEMA_VERSION`=2): `tracks.youtube_id` + índice único parcial. Las canciones añadidas desde la búsqueda no tienen `spotify_id`; se identifican por su vídeo (no se duplican entre playlists). `Track.externalIds.youtubeVideo` ahora se rellena.
+- `src/core/search/searchSongs.ts` (`searchSongs`: filtro Canciones, reintento sin filtro, dedupe, máx. 20).
+- `repository.ts`: `createPlaylist(db, name)` (playlist propia sin Spotify), `addYoutubeTrackToPlaylist(db, playlistId, input)` (transacción; añade al final; no repite en la misma playlist; deja coincidencia `manual` + candidato para que se vea y reproduzca) y `YoutubeTrackInput`.
+- UI: `src/ui/SearchScreen.tsx` (nueva pestaña con lupa en `TabBar`, orden Biblioteca / Buscar / Revisar; tocar resultado = reproducir en el PlayerDock; botón + = añadir), `src/ui/AddToPlaylistSheet.tsx` (lista de playlists + "Nueva playlist"). `App.tsx`: `playSearchResult` (cola de 1 canción), `nowVideoId`.
+- **Limitación conocida:** reimportar una playlist de Spotify (`savePlaylist`) reescribe sus canciones y borraría las añadidas a mano a esa misma playlist. Pendiente decidir: proteger o fusionar.
+- Pendiente posible: quitar canciones de una playlist, reordenar, resultados de "Vídeos", historial de búsquedas.
+
 ## Siguiente sesión (orden recomendado)
 - **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).
 - Verificado por el usuario: paso 8 (biblioteca) funciona.
-- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) búsqueda manual para corregir una canción mal asignada o sin resultado (✖️); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
+- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) ✅ HECHO en paso 10 (búsqueda manual); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
 - Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project`.
 
 ## Pendiente de preguntar / decidir

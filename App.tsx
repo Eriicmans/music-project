@@ -3,6 +3,7 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDim
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
 import { SearchFn } from './src/core/matching/matchTrack';
+import { Track } from './src/models/Track';
 import { buildQueue, QueueItem, shuffleQueue, stepIndex } from './src/core/player/queue';
 import { Db } from './src/db/database';
 import { makeQueueDeps } from './src/db/matchingAdapter';
@@ -12,9 +13,11 @@ import {
 } from './src/db/repository';
 import { ImportError } from './src/importers/errors';
 import { importSpotifyPlaylist } from './src/importers/spotify/importPlaylist';
-import { searchYtMusic } from './src/providers/youtubeMusic/search';
+import { searchYtMusic, YtResult } from './src/providers/youtubeMusic/search';
 import { PlaylistCard, TrackRow } from './src/ui/cards';
 import { Btn, Chip, Disc, Icon, IconBtn } from './src/ui/kit';
+import { ManualSearch } from './src/ui/ManualSearch';
+import { SearchScreen } from './src/ui/SearchScreen';
 import { PlayerDock } from './src/ui/PlayerDock';
 import { ReviewScreen } from './src/ui/ReviewScreen';
 import { Tab, TabBar } from './src/ui/TabBar';
@@ -51,6 +54,7 @@ export default function App() {
   const [nowIdx, setNowIdx] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [shuffle, setShuffle] = useState(false);
+  const [manualFor, setManualFor] = useState<Track | null>(null);
   const [debugOut, setDebugOut] = useState<string | null>(null);
   const signal = useRef({ aborted: false });
 
@@ -179,6 +183,10 @@ export default function App() {
     else { setQueue(base); setNowIdx(Math.max(0, base.findIndex(i => i.trackId === cur.trackId))); }
     setShuffle(!shuffle);
   };
+  const playSearchResult = (r: YtResult) => {
+    const item: QueueItem = { trackId: `yt:${r.videoId}`, videoId: r.videoId, title: r.title, artists: r.artists };
+    setShuffle(false); setBase([item]); setQueue([item]); setNowIdx(0); setPlaying(true);
+  };
   const onPlayerError = () => {
     const cur = nowIdx !== null ? queue[nowIdx] : null;
     setError(`No se pudo reproducir "${cur?.title ?? ''}" (puede no permitir reproducción embebida). Pasando a la siguiente.`);
@@ -186,6 +194,7 @@ export default function App() {
   };
 
   /* ---------- Datos derivados ---------- */
+  const nowVideoId = nowIdx !== null ? queue[nowIdx]?.videoId : undefined;
   const nowTrackId = nowIdx !== null ? queue[nowIdx]?.trackId : undefined;
   const nOf = (st: string) => entries.filter(e => e.status === st).length;
   const ready = nOf('auto') + nOf('manual');
@@ -325,7 +334,7 @@ export default function App() {
               key={e.position} index={e.position + 1} title={e.track.title} artists={e.track.artists.join(', ')}
               videoCaption={v ? `↳ ${v.title} — ${v.artists.join(', ')}` : undefined}
               status={e.status} isNow={e.track.id === nowTrackId} playable={!!v}
-              onPress={() => startAt(e.track.id)}
+              onPress={() => startAt(e.track.id)} onSearch={() => setManualFor(e.track)}
             />
           );
         })}
@@ -337,8 +346,10 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView style={s.safe}>
         {tab === 'review' && db
-          ? <ReviewScreen db={db} onChanged={() => countByStatus(db).then(setCounts)} />
-          : (current ? detail : library)}
+          ? <ReviewScreen db={db} search={search} onChanged={() => countByStatus(db).then(setCounts)} />
+          : tab === 'search' && db
+            ? <SearchScreen db={db} search={search} nowVideoId={nowVideoId} onPlay={playSearchResult} />
+            : (current ? detail : library)}
 
         {tab === 'library' && current && hasPlayable && (
           <View style={s.actionBar}>
@@ -353,6 +364,20 @@ export default function App() {
             onToggle={() => setPlaying(p => !p)} onNext={() => step(1)} onPrev={() => step(-1)}
             onClose={() => { setNowIdx(null); setPlaying(false); }}
             onToggleShuffle={toggleShuffle} onEnded={() => step(1)} onError={onPlayerError} onPlayingChange={setPlaying}
+          />
+        )}
+
+        {manualFor && db && current && (
+          <ManualSearch
+            db={db} track={manualFor} search={search}
+            currentVideoId={entries.find(e => e.track.id === manualFor.id)?.videoId}
+            onClose={() => setManualFor(null)}
+            onPicked={async v => {
+              setManualFor(null);
+              setMessage(`"${manualFor.title}" ahora usa: ${v.title} — ${v.artists.join(', ')}.`);
+              await refresh(db, current.playlistId);
+              setPlaylists(await listPlaylists(db));
+            }}
           />
         )}
 

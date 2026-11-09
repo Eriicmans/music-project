@@ -28,9 +28,9 @@ export function PlaylistCard({ info, width, onPress, onDelete }: {
 }
 
 /** Fila de canción con el vídeo elegido debajo. */
-export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress }: {
+export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress, onSearch }: {
   index: number; title: string; artists: string; videoCaption?: string; status: string | null;
-  isNow: boolean; playable: boolean; onPress: () => void;
+  isNow: boolean; playable: boolean; onPress: () => void; onSearch?: () => void;
 }) {
   return (
     <Pressable onPress={onPress} disabled={!playable} style={s.row}>
@@ -44,6 +44,11 @@ export function TrackRow({ index, title, artists, videoCaption, status, isNow, p
         <Text style={s.artist} numberOfLines={1}>{artists}</Text>
         {videoCaption ? <Text style={s.caption} numberOfLines={1}>{videoCaption}</Text> : null}
       </View>
+      {onSearch && (
+        <Pressable onPress={onSearch} hitSlop={10} style={s.searchBtn}>
+          <Icon name="search" size={15} color={colors.muted} />
+        </Pressable>
+      )}
       <StatusDot status={status} />
     </Pressable>
   );
@@ -61,6 +66,7 @@ const s = StyleSheet.create({
     backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.line,
   },
   num: { width: 40, height: 40, borderRadius: radius.sm, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
+  searchBtn: { width: 32, height: 32, borderRadius: 16, backgroundColor: colors.chip, alignItems: 'center', justifyContent: 'center' },
   numText: { color: colors.muted, fontSize: 13, fontWeight: '700' },
   title: { color: colors.text, fontSize: 15, fontWeight: '700', letterSpacing: -0.1 },
   artist: { color: colors.muted, fontSize: 13 },

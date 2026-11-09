@@ -14,12 +14,16 @@ export const newId = (): string =>
 interface TrackRow {
   id: string; spotify_id: string | null; title: string; artists: string; album: string | null;
   duration_ms: number | null; isrc: string | null; version: string; musicbrainz_id: string | null;
+  youtube_id: string | null;
 }
 const toTrack = (r: TrackRow): Track => ({
   id: r.id, title: r.title, artists: JSON.parse(r.artists) as string[],
   album: r.album ?? undefined, durationMs: r.duration_ms ?? undefined, isrc: r.isrc ?? undefined,
   version: r.version as TrackVersion,
-  externalIds: { spotify: r.spotify_id ?? undefined, musicBrainzRecording: r.musicbrainz_id ?? undefined },
+  externalIds: {
+    spotify: r.spotify_id ?? undefined, youtubeVideo: r.youtube_id ?? undefined,
+    musicBrainzRecording: r.musicbrainz_id ?? undefined,
+  },
 });
 
 /** Inserta la canción o actualiza la existente (clave: id de Spotify). Devuelve el id interno. */
@@ -156,6 +160,30 @@ export async function resolveManual(db: Db, trackId: string, videoId: string): P
   await setMatch(db, trackId, 'manual', videoId, null);
 }
 
+/**
+ * El usuario elige un vídeo salido de una búsqueda manual (puede no estar entre
+ * los candidatos guardados). Se guarda como candidato y como coincidencia manual,
+ * de modo que la playlist pueda mostrar y reproducir el vídeo elegido.
+ */
+export async function resolveManualFromSearch(
+  db: Db, trackId: string, candidate: TrackCandidate, result: MatchResult,
+): Promise<void> {
+  await db.execAsync('BEGIN');
+  try {
+    await db.runAsync(
+      `INSERT OR REPLACE INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, candidate.provider, candidate.externalId, candidate.title, JSON.stringify(candidate.artists),
+       candidate.durationMs ?? null, candidate.version, result.score, result.decision,
+       JSON.stringify(result.reasons), JSON.stringify(result.conflicts), JSON.stringify(result.warnings)]);
+    await setMatch(db, trackId, 'manual', candidate.externalId, null);
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}
+
 export interface PendingReview { track: Track; candidates: StoredCandidate[] }
 
 export async function listPendingReviews(db: Db): Promise<PendingReview[]> {
@@ -235,6 +263,60 @@ export async function deletePlaylist(db: Db, playlistId: string): Promise<void> 
     await db.runAsync('DELETE FROM playlists WHERE id = ?', [playlistId]);
     await db.execAsync('DELETE FROM tracks WHERE id NOT IN (SELECT track_id FROM playlist_tracks)');
     await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+}
+
+/** Crea una playlist propia (sin origen en Spotify). Devuelve su id. */
+export async function createPlaylist(db: Db, name: string): Promise<string> {
+  const clean = name.trim();
+  if (!clean) throw new Error('El nombre de la playlist no puede estar vacío');
+  const id = newId();
+  await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,NULL,?,NULL,?)',
+    [id, clean, now()]);
+  return id;
+}
+
+export interface YoutubeTrackInput {
+  videoId: string; title: string; artists: string[]; album?: string; durationMs?: number; version: TrackVersion;
+}
+
+/**
+ * Añade al final de una playlist una canción encontrada en la búsqueda.
+ * La canción se identifica por su vídeo (no se duplica entre playlists) y queda
+ * con el vídeo ya elegido (coincidencia manual). Si ya estaba en esa playlist no se repite.
+ */
+export async function addYoutubeTrackToPlaylist(
+  db: Db, playlistId: string, t: YoutubeTrackInput,
+): Promise<{ added: boolean; trackId: string }> {
+  await db.execAsync('BEGIN');
+  try {
+    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE youtube_id = ?', [t.videoId]);
+    const trackId = existing?.id ?? newId();
+    if (!existing) {
+      await db.runAsync(
+        `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, youtube_id, created_at)
+         VALUES (?,NULL,?,?,?,?,NULL,?,NULL,?,?)`,
+        [trackId, t.title, JSON.stringify(t.artists), t.album ?? null, t.durationMs ?? null, t.version, t.videoId, now()]);
+    }
+    const dup = await db.getFirstAsync<{ track_id: string }>(
+      'SELECT track_id FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [playlistId, trackId]);
+    if (dup) { await db.execAsync('COMMIT'); return { added: false, trackId }; }
+
+    const next = await db.getFirstAsync<{ n: number }>(
+      'SELECT COALESCE(MAX(position), -1) + 1 AS n FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+    await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)',
+      [playlistId, next?.n ?? 0, trackId]);
+    await db.runAsync(
+      `INSERT OR REPLACE INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, 'youtube', t.videoId, t.title, JSON.stringify(t.artists), t.durationMs ?? null, t.version,
+       100, 'auto', JSON.stringify(['elegida desde la búsqueda']), '[]', '[]']);
+    await setMatch(db, trackId, 'manual', t.videoId, null);
+    await db.execAsync('COMMIT');
+    return { added: true, trackId };
   } catch (error) {
     await db.execAsync('ROLLBACK');
     throw error;
