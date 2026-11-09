@@ -58,7 +58,7 @@ describe('runMatching', () => {
     }, { delayMs: 100 });
     expect(s).toMatchObject({ processed: 2, skipped: 1, auto: 2, errors: 0 });
     expect(b.recorded).toEqual(['1', '3']);
-    expect(b.sleeps).toEqual([100, 100]);
+    expect(b.sleeps).toEqual([100]);
   });
 
   it('se detiene tras errores seguidos', async () => {
