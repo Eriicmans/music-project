@@ -1,0 +1,2096 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+assets/
+  android-icon-background.png
+  android-icon-foreground.png
+  android-icon-monochrome.png
+  favicon.png
+  icon.png
+  splash-icon.png
+src/
+  core/
+    matching/
+      matchQueue.ts
+      matchTrack.ts
+      parseTitle.ts
+      scoreCandidate.ts
+  db/
+    database.ts
+    migrations.ts
+    openDb.ts
+    repository.ts
+  importers/
+    spotify/
+      embed.ts
+      importPlaylist.ts
+      parseUrl.ts
+    errors.ts
+  models/
+    Track.ts
+  providers/
+    youtubeMusic/
+      search.ts
+      toCandidate.ts
+tests/
+  helpers/
+    nodeSqliteDb.ts
+  db.test.ts
+  matching-cases.md
+  matchQueue.test.ts
+  scoreCandidate.test.ts
+  spotify.test.ts
+  youtubeMusic.test.ts
+.gitignore
+AGENTS.md
+app.json
+App.tsx
+CONTEXT.md
+eas.json
+index.ts
+LICENSE
+package.json
+README.md
+tsconfig.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/core/matching/matchQueue.ts">
+import { Track } from '../../models/Track';
+import { ScoredCandidate, SearchFn, findCandidates } from './matchTrack';
+
+export interface QueueDeps {
+  search: SearchFn;
+  /** Guarda el resultado (adaptar a repository.recordMatching). */
+  record: (track: Track, scored: ScoredCandidate[]) => Promise<void>;
+  /** Devuelve true si la canción ya tiene coincidencia auto/manual. */
+  shouldSkip?: (track: Track) => Promise<boolean>;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+}
+
+export interface QueueProgress {
+  done: number;
+  total: number;
+  track: Track;
+}
+
+export interface QueueOptions {
+  /** Pausa base entre búsquedas (más hasta un 50 % de variación). */
+  delayMs?: number;
+  /** Se detiene tras N errores seguidos (posible bloqueo). */
+  maxConsecutiveErrors?: number;
+  onProgress?: (p: QueueProgress) => void;
+  signal?: { aborted: boolean };
+}
+
+export interface QueueSummary {
+  processed: number;
+  skipped: number;
+  auto: number;
+  review: number;
+  none: number;
+  errors: number;
+  aborted: boolean;
+  stoppedByErrors: boolean;
+}
+
+const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function runMatching(
+  tracks: Track[],
+  deps: QueueDeps,
+  opts: QueueOptions = {},
+): Promise<QueueSummary> {
+  const sleep = deps.sleep ?? defaultSleep;
+  const random = deps.random ?? Math.random;
+  const delayMs = opts.delayMs ?? 800;
+  const maxErrors = opts.maxConsecutiveErrors ?? 5;
+  const s: QueueSummary = {
+    processed: 0, skipped: 0, auto: 0, review: 0, none: 0,
+    errors: 0, aborted: false, stoppedByErrors: false,
+  };
+  let consecutive = 0;
+  let done = 0;
+
+  for (const track of tracks) {
+    if (opts.signal?.aborted) { s.aborted = true; break; }
+
+    if (deps.shouldSkip && (await deps.shouldSkip(track))) {
+      s.skipped++; done++;
+      opts.onProgress?.({ done, total: tracks.length, track });
+      continue;
+    }
+
+    try {
+      const scored = await findCandidates(track, deps.search);
+      await deps.record(track, scored);
+      const best = scored.find((x) => x.result.decision !== 'reject');
+      if (!best) s.none++;
+      else if (best.result.decision === 'auto') s.auto++;
+      else s.review++;
+      s.processed++;
+      consecutive = 0;
+    } catch {
+      s.errors++;
+      consecutive++;
+      if (consecutive >= maxErrors) { s.stoppedByErrors = true; break; }
+    }
+
+    done++;
+    opts.onProgress?.({ done, total: tracks.length, track });
+    if (done < tracks.length) await sleep(delayMs + Math.floor(random() * delayMs * 0.5));
+  }
+  return s;
+}
+</file>
+
+<file path="src/core/matching/matchTrack.ts">
+import { Track, TrackCandidate } from '../../models/Track';
+import { MatchResult, scoreCandidate } from './scoreCandidate';
+import { YtResult, buildQuery } from '../../providers/youtubeMusic/search';
+import { toCandidate } from '../../providers/youtubeMusic/toCandidate';
+
+export interface ScoredCandidate {
+  candidate: TrackCandidate;
+  result: MatchResult;
+}
+
+export type SearchFn = (query: string, opts?: { filter?: boolean }) => Promise<YtResult[]>;
+
+const RANK = { auto: 0, review: 1, reject: 2 } as const;
+
+/**
+ * Busca candidatos para una canción y los puntúa, mejores primero.
+ * Si la búsqueda filtrada a "Canciones" no devuelve nada (el filtro puede
+ * haber cambiado), reintenta sin filtro descartando resultados 'other'.
+ */
+export async function findCandidates(track: Track, search: SearchFn): Promise<ScoredCandidate[]> {
+  const query = buildQuery(track.title, track.artists);
+  let results = await search(query);
+  if (results.length === 0) {
+    results = (await search(query, { filter: false })).filter((r) => r.kind !== 'other');
+  }
+  return results
+    .map(toCandidate)
+    .map((candidate) => ({ candidate, result: scoreCandidate(track, candidate) }))
+    .sort(
+      (a, b) =>
+        RANK[a.result.decision] - RANK[b.result.decision] || b.result.score - a.result.score,
+    );
+}
+</file>
+
+<file path="src/core/matching/parseTitle.ts">
+import { TrackVersion } from '../../models/Track';
+
+export interface ParsedTitle {
+  /** Título limpio, sin marcadores de versión, feat. ni ruido de YouTube. */
+  baseTitle: string;
+  /** 'studio' si no hay ningún marcador de versión. */
+  version: TrackVersion;
+  featured: string[];
+}
+
+const VERSION_RULES: Array<[TrackVersion, RegExp]> = [
+  ['karaoke', /karaoke|backing track/i],
+  ['instrumental', /instrumental/i],
+  ['live', /\blive\b|en vivo|en directo|unplugged/i],
+  ['acoustic', /acoustic|ac[uú]stic[oa]/i],
+  ['remix', /remix|\brmx\b|bootleg|mashup|\b(extended|club|dub|vip) mix\b/i],
+  ['cover', /\bcover\b/i],
+  ['altered', /sped up|speed up|slowed|nightcore|8d audio|reverb|bass boosted/i],
+];
+
+const NOISE_WORDS = new Set([
+  'official', 'video', 'audio', 'lyrics', 'lyric', 'visualizer', 'visualiser',
+  'hd', '4k', 'hq', 'remastered', 'remaster', 'radio', 'edit', 'single', 'version',
+  'album', 'explicit', 'clean', 'mono', 'stereo', 'music', 'mv', 'original',
+  'deluxe', 'bonus', 'track', 'topic', 'with', 'and',
+]);
+
+const FEAT_GROUP = /^(?:feat\.?|ft\.?|featuring|with)\s+(.+)$/i;
+const FEAT_INLINE = /\s+(?:feat\.?|ft\.?|featuring)\s+(.+)$/i;
+const ARTIST_SPLIT = /\s*(?:,|&|;|\bx\b|\band\b|\by\b|\bfeat\.?|\bft\.?|\bwith\b)\s*/i;
+
+const plain = (v: string): string =>
+  v.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase()
+    .replace(/&/g, 'and').replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+
+export function splitArtists(raw: string): string[] {
+  return raw.split(ARTIST_SPLIT).map(s => s.trim()).filter(Boolean);
+}
+
+function isNoise(text: string): boolean {
+  const tokens = plain(text).split(' ').filter(Boolean);
+  return tokens.length > 0 && tokens.every(t => NOISE_WORDS.has(t) || /^\d{4}$/.test(t));
+}
+
+/**
+ * Limpia un título de Spotify o YouTube. `knownArtists` permite quitar el
+ * prefijo "Artista - " típico de YouTube.
+ */
+export function parseTitle(raw: string, knownArtists: string[] = []): ParsedTitle {
+  let version: TrackVersion = 'studio';
+  const featured: string[] = [];
+  const kept: string[] = [];
+
+  const classify = (chunk: string): string | null => {
+    const text = chunk.trim();
+    if (!text) return null;
+    for (const [v, re] of VERSION_RULES) {
+      if (re.test(text)) { if (version === 'studio') version = v; return null; }
+    }
+    const feat = FEAT_GROUP.exec(text);
+    if (feat) { featured.push(...splitArtists(feat[1])); return null; }
+    if (isNoise(text)) return null;
+    return text;
+  };
+
+  // 1) Grupos entre paréntesis o corchetes.
+  let work = raw.replace(/[(\[]([^)\]]*)[)\]]/g, (_m, inner: string) => {
+    const keep = classify(inner);
+    return keep ? ` ${keep} ` : ' ';
+  });
+
+  // 2) Segmentos separados por " - ".
+  let segments = work.split(/\s[-–—]\s/).map(s => s.trim()).filter(Boolean);
+  if (segments.length >= 2) {
+    const known = new Set(knownArtists.flatMap(a => [plain(a), ...splitArtists(a).map(plain)]));
+    if (known.has(plain(segments[0]))) segments = segments.slice(1);
+  }
+  let base = segments[0] ?? '';
+  for (const seg of segments.slice(1)) {
+    const keep = classify(seg);
+    if (keep) kept.push(keep);
+  }
+
+  // 3) "Título feat. X" sin paréntesis.
+  const inline = FEAT_INLINE.exec(base);
+  if (inline) { featured.push(...splitArtists(inline[1])); base = base.slice(0, inline.index); }
+
+  const baseTitle = [base, ...kept].join(' ').replace(/\s+/g, ' ').trim();
+  return { baseTitle, version, featured };
+}
+
+function bigrams(s: string): string[] {
+  const t = s.replace(/ /g, '');
+  if (t.length < 2) return [t];
+  const out: string[] = [];
+  for (let i = 0; i < t.length - 1; i++) out.push(t.slice(i, i + 2));
+  return out;
+}
+
+/** Similitud 0..1 (coeficiente de Dice sobre bigramas). Tolera erratas leves. */
+export function titleSimilarity(a: string, b: string): number {
+  const x = plain(a), y = plain(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  const bx = bigrams(x), by = bigrams(y);
+  const counts = new Map<string, number>();
+  for (const g of bx) counts.set(g, (counts.get(g) ?? 0) + 1);
+  let hits = 0;
+  for (const g of by) {
+    const c = counts.get(g) ?? 0;
+    if (c > 0) { hits++; counts.set(g, c - 1); }
+  }
+  return (2 * hits) / (bx.length + by.length);
+}
+</file>
+
+<file path="src/core/matching/scoreCandidate.ts">
+import { Track, TrackCandidate, TrackVersion } from '../../models/Track';
+import { parseTitle, splitArtists, titleSimilarity } from './parseTitle';
+
+export type MatchDecision = 'auto' | 'review' | 'reject';
+
+export interface MatchResult {
+  score: number;
+  decision: MatchDecision;
+  reasons: string[];
+  conflicts: string[];
+  /** Señales débiles: impiden la aceptación automática pero no la revisión. */
+  warnings: string[];
+}
+
+export const normalize = (value: string): string =>
+  value.normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+const sameText = (a?: string, b?: string): boolean =>
+  Boolean(a && b && normalize(a) === normalize(b));
+
+/** Nombres completos y sus partes ("A & B" -> "a and b", "a", "b"). */
+function artistSet(artists: string[], featured: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const name of [...artists, ...featured]) {
+    out.add(normalize(name));
+    splitArtists(name).forEach(p => out.add(normalize(p)));
+  }
+  out.delete('');
+  return out;
+}
+
+function effectiveVersion(parsed: TrackVersion, declared: TrackVersion): TrackVersion {
+  if (parsed !== 'studio') return parsed;
+  return declared === 'unknown' ? 'studio' : declared;
+}
+
+export function scoreCandidate(track: Track, candidate: TrackCandidate): MatchResult {
+  let score = 0;
+  const reasons: string[] = [];
+  const conflicts: string[] = [];
+  const warnings: string[] = [];
+
+  const known = [...track.artists, ...candidate.artists];
+  const tp = parseTitle(track.title, known);
+  const cp = parseTitle(candidate.title, known);
+
+  // Identidad fuerte: ISRC.
+  let isrcMatch = false;
+  if (track.isrc && candidate.isrc) {
+    if (normalize(track.isrc) === normalize(candidate.isrc)) {
+      isrcMatch = true; score += 40; reasons.push('ISRC exacto');
+    } else conflicts.push('ISRC diferente');
+  }
+
+  // Artistas (con invitados extraídos del título).
+  const trackArtists = artistSet(track.artists, tp.featured);
+  const candArtists = artistSet(candidate.artists, cp.featured);
+  const primary = track.artists[0] ? normalize(track.artists[0]) : '';
+  const primaryMatch = Boolean(primary && candArtists.has(primary));
+  const anyMatch = [...trackArtists].some(a => candArtists.has(a));
+  if (primaryMatch) {
+    score += 25; reasons.push('Artista principal coincidente');
+  } else if (anyMatch) {
+    score += 12; warnings.push('Solo coincide un artista secundario');
+  } else if (track.artists.length && candidate.artists.length) {
+    conflicts.push('Artista no coincidente');
+  }
+
+  // Título (ya sin feat., versión ni ruido).
+  const exactTitle = sameText(tp.baseTitle, cp.baseTitle);
+  if (exactTitle) {
+    score += 15; reasons.push('Título coincidente');
+  } else if (titleSimilarity(tp.baseTitle, cp.baseTitle) >= 0.85) {
+    score += 10; warnings.push('Título muy similar, no idéntico');
+  } else conflicts.push('Título diferente');
+
+  // Duración.
+  let durationClose = false;
+  if (track.durationMs && candidate.durationMs) {
+    const delta = Math.abs(track.durationMs - candidate.durationMs);
+    if (delta <= 2000) { durationClose = true; score += 10; reasons.push('Duración muy próxima'); }
+    else if (delta <= 5000) { score += 5; reasons.push('Duración razonablemente próxima'); }
+    else conflicts.push('Duración muy diferente');
+  }
+
+  // Versión: la ausencia de marcador se interpreta como estudio en ambos lados.
+  const tv = effectiveVersion(tp.version, track.version);
+  const cv = effectiveVersion(cp.version, candidate.version);
+  const versionsAgree = tv === cv;
+  if (versionsAgree) { score += 10; reasons.push('Versión coincidente'); }
+  else conflicts.push('Versión diferente');
+
+  if (sameText(track.album, candidate.album)) reasons.push('Álbum coincidente');
+
+  // Decisión. Sin ISRC (lo normal en YouTube) solo se autoacepta con metadatos
+  // estrictos: artista principal + título exacto + duración ±2 s + misma versión.
+  const clean = conflicts.length === 0 && warnings.length === 0 && primaryMatch;
+  const strongMetadata = exactTitle && durationClose && versionsAgree;
+  let decision: MatchDecision = 'reject';
+  if (clean && (isrcMatch ? score >= 90 : strongMetadata)) {
+    decision = 'auto';
+  } else if (
+    !conflicts.includes('Artista no coincidente') &&
+    !conflicts.includes('Versión diferente') &&
+    !conflicts.includes('ISRC diferente') &&
+    score >= 40
+  ) {
+    decision = 'review';
+  }
+
+  return { score, decision, reasons, conflicts, warnings };
+}
+</file>
+
+<file path="src/db/database.ts">
+/**
+ * Interfaz mínima de base de datos. Coincide con un subconjunto de
+ * `SQLiteDatabase` de expo-sqlite, así el código se puede probar en Node.
+ */
+export type SqlParam = string | number | null;
+
+export interface Db {
+  execAsync(sql: string): Promise<void>;
+  runAsync(sql: string, params?: SqlParam[]): Promise<unknown>;
+  getAllAsync<T>(sql: string, params?: SqlParam[]): Promise<T[]>;
+  getFirstAsync<T>(sql: string, params?: SqlParam[]): Promise<T | null>;
+}
+</file>
+
+<file path="src/db/migrations.ts">
+import { Db } from './database';
+
+/** Cada elemento es una versión del esquema; se aplican en orden. */
+const MIGRATIONS: string[][] = [
+  [
+    `CREATE TABLE tracks (
+      id TEXT PRIMARY KEY,
+      spotify_id TEXT UNIQUE,
+      title TEXT NOT NULL,
+      artists TEXT NOT NULL,
+      album TEXT,
+      duration_ms INTEGER,
+      isrc TEXT,
+      version TEXT NOT NULL,
+      musicbrainz_id TEXT,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE TABLE playlists (
+      id TEXT PRIMARY KEY,
+      spotify_id TEXT UNIQUE,
+      name TEXT NOT NULL,
+      source_url TEXT,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE TABLE playlist_tracks (
+      playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL,
+      track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      PRIMARY KEY (playlist_id, position)
+    )`,
+    `CREATE TABLE candidates (
+      track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL,
+      external_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artists TEXT NOT NULL,
+      duration_ms INTEGER,
+      version TEXT NOT NULL,
+      score REAL NOT NULL,
+      decision TEXT NOT NULL,
+      reasons TEXT NOT NULL,
+      conflicts TEXT NOT NULL,
+      warnings TEXT NOT NULL,
+      PRIMARY KEY (track_id, provider, external_id)
+    )`,
+    `CREATE TABLE matches (
+      track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+      video_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('auto','manual','pending','none')),
+      score REAL,
+      updated_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX idx_matches_status ON matches(status)`,
+    `CREATE INDEX idx_playlist_tracks_track ON playlist_tracks(track_id)`,
+  ],
+];
+
+export const SCHEMA_VERSION = MIGRATIONS.length;
+
+export async function migrate(db: Db): Promise<number> {
+  const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
+  let version = row?.user_version ?? 0;
+  for (; version < MIGRATIONS.length; version++) {
+    await db.execAsync('BEGIN');
+    try {
+      for (const statement of MIGRATIONS[version]) await db.execAsync(statement);
+      await db.execAsync(`PRAGMA user_version = ${version + 1}`);
+      await db.execAsync('COMMIT');
+    } catch (error) {
+      await db.execAsync('ROLLBACK');
+      throw error;
+    }
+  }
+  return version;
+}
+</file>
+
+<file path="src/db/openDb.ts">
+import * as SQLite from 'expo-sqlite';
+import { Db } from './database';
+import { migrate } from './migrations';
+
+let opening: Promise<Db> | null = null;
+
+/** Abre (una sola vez) la base de datos local y aplica las migraciones. */
+export function openDb(): Promise<Db> {
+  if (!opening) {
+    opening = (async () => {
+      const db = (await SQLite.openDatabaseAsync('music.db')) as unknown as Db;
+      await db.execAsync('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+      await migrate(db);
+      return db;
+    })();
+    opening.catch(() => { opening = null; });
+  }
+  return opening;
+}
+</file>
+
+<file path="src/db/repository.ts">
+import { Track, TrackCandidate, TrackVersion } from '../models/Track';
+import { MatchResult } from '../core/matching/scoreCandidate';
+import { Db } from './database';
+
+export type MatchStatus = 'auto' | 'manual' | 'pending' | 'none';
+export interface ScoredCandidate { candidate: TrackCandidate; result: MatchResult }
+export interface StoredCandidate extends TrackCandidate { score: number; decision: string; reasons: string[]; conflicts: string[]; warnings: string[] }
+
+const MAX_CANDIDATES = 5;
+const now = () => Date.now();
+export const newId = (): string =>
+  Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+
+interface TrackRow {
+  id: string; spotify_id: string | null; title: string; artists: string; album: string | null;
+  duration_ms: number | null; isrc: string | null; version: string; musicbrainz_id: string | null;
+}
+const toTrack = (r: TrackRow): Track => ({
+  id: r.id, title: r.title, artists: JSON.parse(r.artists) as string[],
+  album: r.album ?? undefined, durationMs: r.duration_ms ?? undefined, isrc: r.isrc ?? undefined,
+  version: r.version as TrackVersion,
+  externalIds: { spotify: r.spotify_id ?? undefined, musicBrainzRecording: r.musicbrainz_id ?? undefined },
+});
+
+/** Inserta la canción o actualiza la existente (clave: id de Spotify). Devuelve el id interno. */
+export async function upsertTrack(db: Db, track: Track): Promise<string> {
+  const spotify = track.externalIds.spotify ?? null;
+  if (spotify) {
+    const existing = await db.getFirstAsync<{ id: string }>('SELECT id FROM tracks WHERE spotify_id = ?', [spotify]);
+    if (existing) {
+      await db.runAsync(
+        'UPDATE tracks SET title=?, artists=?, album=?, duration_ms=?, isrc=?, version=? WHERE id=?',
+        [track.title, JSON.stringify(track.artists), track.album ?? null, track.durationMs ?? null,
+         track.isrc ?? null, track.version, existing.id]);
+      return existing.id;
+    }
+  }
+  await db.runAsync(
+    `INSERT INTO tracks (id, spotify_id, title, artists, album, duration_ms, isrc, version, musicbrainz_id, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [track.id, spotify, track.title, JSON.stringify(track.artists), track.album ?? null,
+     track.durationMs ?? null, track.isrc ?? null, track.version,
+     track.externalIds.musicBrainzRecording ?? null, now()]);
+  return track.id;
+}
+
+export async function getTrack(db: Db, id: string): Promise<Track | null> {
+  const row = await db.getFirstAsync<TrackRow>('SELECT * FROM tracks WHERE id = ?', [id]);
+  return row ? toTrack(row) : null;
+}
+
+/**
+ * Guarda una playlist y el orden de sus canciones. Reimportar la misma playlist
+ * (mismo spotifyId) la actualiza en vez de duplicarla.
+ */
+export async function savePlaylist(
+  db: Db,
+  playlist: { name: string; spotifyId?: string; sourceUrl?: string },
+  trackIds: string[],
+): Promise<string> {
+  let id: string | undefined;
+  if (playlist.spotifyId) {
+    id = (await db.getFirstAsync<{ id: string }>('SELECT id FROM playlists WHERE spotify_id = ?', [playlist.spotifyId]))?.id;
+  }
+  await db.execAsync('BEGIN');
+  try {
+    if (id) {
+      await db.runAsync('UPDATE playlists SET name=?, source_url=? WHERE id=?', [playlist.name, playlist.sourceUrl ?? null, id]);
+      await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [id]);
+    } else {
+      id = newId();
+      await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,?,?,?,?)',
+        [id, playlist.spotifyId ?? null, playlist.name, playlist.sourceUrl ?? null, now()]);
+    }
+    for (let i = 0; i < trackIds.length; i++) {
+      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, trackIds[i]]);
+    }
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+  return id;
+}
+
+export interface PlaylistEntry { position: number; track: Track; status: MatchStatus | null; videoId: string | null }
+
+export async function getPlaylistEntries(db: Db, playlistId: string): Promise<PlaylistEntry[]> {
+  const rows = await db.getAllAsync<TrackRow & { position: number; m_status: string | null; m_video: string | null }>(
+    `SELECT t.*, pt.position, m.status AS m_status, m.video_id AS m_video
+     FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+     LEFT JOIN matches m ON m.track_id = t.id
+     WHERE pt.playlist_id = ? ORDER BY pt.position`, [playlistId]);
+  return rows.map(r => ({ position: r.position, track: toTrack(r), status: r.m_status as MatchStatus | null, videoId: r.m_video }));
+}
+
+/** Caché: vídeo ya resuelto (auto o manual) para una canción de Spotify. */
+export async function getCachedVideoId(db: Db, spotifyId: string): Promise<string | null> {
+  const row = await db.getFirstAsync<{ video_id: string }>(
+    `SELECT m.video_id FROM matches m JOIN tracks t ON t.id = m.track_id
+     WHERE t.spotify_id = ? AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL`, [spotifyId]);
+  return row?.video_id ?? null;
+}
+
+export async function getMatchStatus(db: Db, trackId: string): Promise<{ status: MatchStatus; videoId: string | null } | null> {
+  const row = await db.getFirstAsync<{ status: string; video_id: string | null }>(
+    'SELECT status, video_id FROM matches WHERE track_id = ?', [trackId]);
+  return row ? { status: row.status as MatchStatus, videoId: row.video_id } : null;
+}
+
+async function setMatch(db: Db, trackId: string, status: MatchStatus, videoId: string | null, score: number | null) {
+  await db.runAsync(
+    `INSERT INTO matches (track_id, video_id, status, score, updated_at) VALUES (?,?,?,?,?)
+     ON CONFLICT(track_id) DO UPDATE SET video_id=excluded.video_id, status=excluded.status,
+       score=excluded.score, updated_at=excluded.updated_at`,
+    [trackId, videoId, status, score, now()]);
+}
+
+/**
+ * Registra el resultado del matching de una canción. Una decisión manual
+ * previa del usuario nunca se sobrescribe.
+ */
+export async function recordMatching(db: Db, trackId: string, scored: ScoredCandidate[]): Promise<MatchStatus> {
+  const current = await getMatchStatus(db, trackId);
+  if (current?.status === 'manual') return 'manual';
+
+  const usable = scored
+    .filter(s => s.result.decision !== 'reject')
+    .sort((a, b) => b.result.score - a.result.score)
+    .slice(0, MAX_CANDIDATES);
+
+  await db.runAsync('DELETE FROM candidates WHERE track_id = ?', [trackId]);
+  for (const { candidate: c, result: r } of usable) {
+    await db.runAsync(
+      `INSERT INTO candidates (track_id, provider, external_id, title, artists, duration_ms, version,
+         score, decision, reasons, conflicts, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [trackId, c.provider, c.externalId, c.title, JSON.stringify(c.artists), c.durationMs ?? null, c.version,
+       r.score, r.decision, JSON.stringify(r.reasons), JSON.stringify(r.conflicts), JSON.stringify(r.warnings)]);
+  }
+
+  const best = usable[0];
+  if (best && best.result.decision === 'auto' && best.candidate.provider === 'youtube') {
+    await setMatch(db, trackId, 'auto', best.candidate.externalId, best.result.score);
+    return 'auto';
+  }
+  if (usable.length > 0) {
+    await setMatch(db, trackId, 'pending', null, best.result.score);
+    return 'pending';
+  }
+  await setMatch(db, trackId, 'none', null, null);
+  return 'none';
+}
+
+/** El usuario elige un vídeo concreto para una canción. */
+export async function resolveManual(db: Db, trackId: string, videoId: string): Promise<void> {
+  await setMatch(db, trackId, 'manual', videoId, null);
+}
+
+export interface PendingReview { track: Track; candidates: StoredCandidate[] }
+
+export async function listPendingReviews(db: Db): Promise<PendingReview[]> {
+  const rows = await db.getAllAsync<TrackRow>(
+    `SELECT t.* FROM tracks t JOIN matches m ON m.track_id = t.id
+     WHERE m.status = 'pending' ORDER BY t.created_at, t.title`);
+  const out: PendingReview[] = [];
+  for (const row of rows) {
+    const cands = await db.getAllAsync<{
+      provider: string; external_id: string; title: string; artists: string; duration_ms: number | null;
+      version: string; score: number; decision: string; reasons: string; conflicts: string; warnings: string;
+    }>('SELECT * FROM candidates WHERE track_id = ? ORDER BY score DESC', [row.id]);
+    out.push({
+      track: toTrack(row),
+      candidates: cands.map(c => ({
+        provider: c.provider as TrackCandidate['provider'], externalId: c.external_id, title: c.title,
+        artists: JSON.parse(c.artists), durationMs: c.duration_ms ?? undefined, version: c.version as TrackVersion,
+        score: c.score, decision: c.decision, reasons: JSON.parse(c.reasons),
+        conflicts: JSON.parse(c.conflicts), warnings: JSON.parse(c.warnings),
+      })),
+    });
+  }
+  return out;
+}
+
+export async function countByStatus(db: Db): Promise<Record<string, number>> {
+  const rows = await db.getAllAsync<{ status: string; n: number }>('SELECT status, COUNT(*) AS n FROM matches GROUP BY status');
+  const out: Record<string, number> = {};
+  for (const r of rows) out[r.status] = r.n;
+  return out;
+}
+</file>
+
+<file path="src/importers/spotify/embed.ts">
+import { ImportError } from '../errors';
+
+export interface EmbedTrack {
+  spotifyId: string;
+  title: string;
+  artists: string[];
+  durationMs?: number;
+}
+export interface EmbedPlaylist {
+  name: string;
+  tracks: EmbedTrack[];
+  /** true si la lista alcanzó el tope del embed (≈100): puede haber más canciones. */
+  partial: boolean;
+  /** Pistas omitidas (archivos locales, episodios, entradas sin id). */
+  skipped: number;
+}
+
+export const EMBED_TRACK_CAP = 100;
+
+export function extractNextData(html: string): unknown {
+  const m = /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/.exec(html);
+  if (!m) throw new ImportError('parse', 'La página de Spotify no tiene el formato esperado (¿ha cambiado?).');
+  try { return JSON.parse(m[1]); }
+  catch { throw new ImportError('parse', 'No se pudo leer los datos de la página de Spotify.'); }
+}
+
+/** Busca una clave en un árbol JSON (tolera cambios de estructura). */
+function findKey(node: unknown, key: string, depth = 0): unknown {
+  if (!node || typeof node !== 'object' || depth > 12) return undefined;
+  const obj = node as Record<string, unknown>;
+  if (key in obj) return obj[key];
+  for (const value of Object.values(obj)) {
+    const found = findKey(value, key, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+export function artistsFromSubtitle(subtitle: unknown): string[] {
+  if (typeof subtitle !== 'string') return [];
+  return subtitle.replace(/\u00a0/g, ' ').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+export function parseEmbedHtml(html: string): EmbedPlaylist {
+  const data = extractNextData(html);
+  const entity = findKey(data, 'entity') as Record<string, unknown> | null | undefined;
+  const list = (entity && (entity.trackList as unknown)) ?? findKey(data, 'trackList');
+  if (!Array.isArray(list)) {
+    throw new ImportError('unavailable', 'No se pudo leer la playlist: puede ser privada, estar borrada o no estar disponible.');
+  }
+
+  const tracks: EmbedTrack[] = [];
+  let skipped = 0;
+  for (const raw of list as Array<Record<string, unknown>>) {
+    const uri = typeof raw.uri === 'string' ? raw.uri : '';
+    const m = /^spotify:track:([A-Za-z0-9]{22})$/.exec(uri);
+    const title = typeof raw.title === 'string' ? raw.title : typeof raw.name === 'string' ? raw.name : '';
+    if (!m || !title) { skipped++; continue; }
+    tracks.push({
+      spotifyId: m[1],
+      title,
+      artists: artistsFromSubtitle(raw.subtitle),
+      durationMs: typeof raw.duration === 'number' && raw.duration > 0 ? Math.round(raw.duration) : undefined,
+    });
+  }
+
+  const nameRaw = entity?.name ?? entity?.title;
+  return {
+    name: typeof nameRaw === 'string' && nameRaw ? nameRaw : 'Playlist de Spotify',
+    tracks,
+    partial: list.length >= EMBED_TRACK_CAP,
+    skipped,
+  };
+}
+
+export type FetchFn = (url: string, init?: { headers?: Record<string, string> }) =>
+  Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
+
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+export async function fetchEmbedPlaylist(playlistId: string, fetchFn: FetchFn): Promise<EmbedPlaylist> {
+  let res;
+  try {
+    res = await fetchFn(`https://open.spotify.com/embed/playlist/${playlistId}`, { headers: HEADERS });
+  } catch {
+    throw new ImportError('network', 'No hay conexión con Spotify. Revisa tu internet e inténtalo de nuevo.');
+  }
+  if (res.status === 404) throw new ImportError('unavailable', 'Esa playlist no existe o es privada.');
+  if (!res.ok) throw new ImportError('network', `Spotify respondió con el error ${res.status}.`);
+  return parseEmbedHtml(await res.text());
+}
+</file>
+
+<file path="src/importers/spotify/importPlaylist.ts">
+import { Db } from '../../db/database';
+import { newId, savePlaylist, upsertTrack } from '../../db/repository';
+import { parseTitle } from '../../core/matching/parseTitle';
+import { Track } from '../../models/Track';
+import { fetchEmbedPlaylist, FetchFn } from './embed';
+import { parsePlaylistId } from './parseUrl';
+
+export interface ImportSummary {
+  playlistId: string;
+  name: string;
+  total: number;
+  newTracks: number;
+  skipped: number;
+  /** Puede haber más canciones de las importadas (tope del embed). */
+  partial: boolean;
+}
+
+/** Importa una playlist pública de Spotify a la base de datos local. */
+export async function importSpotifyPlaylist(db: Db, input: string, fetchFn: FetchFn = fetch as unknown as FetchFn): Promise<ImportSummary> {
+  const spotifyPlaylistId = parsePlaylistId(input);
+  const playlist = await fetchEmbedPlaylist(spotifyPlaylistId, fetchFn);
+
+  const ids: string[] = [];
+  let newTracks = 0;
+  await db.execAsync('BEGIN');
+  try {
+    for (const t of playlist.tracks) {
+      const track: Track = {
+        id: newId(),
+        title: t.title,
+        artists: t.artists,
+        durationMs: t.durationMs,
+        version: parseTitle(t.title, t.artists).version,
+        externalIds: { spotify: t.spotifyId },
+      };
+      const id = await upsertTrack(db, track);
+      if (id === track.id) newTracks++;
+      ids.push(id);
+    }
+    await db.execAsync('COMMIT');
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
+
+  const playlistId = await savePlaylist(
+    db,
+    { name: playlist.name, spotifyId: spotifyPlaylistId, sourceUrl: input.trim() },
+    ids,
+  );
+  return { playlistId, name: playlist.name, total: ids.length, newTracks, skipped: playlist.skipped, partial: playlist.partial };
+}
+</file>
+
+<file path="src/importers/spotify/parseUrl.ts">
+import { ImportError } from '../errors';
+
+const REF = /(?:open|play|embed)\.spotify\.com\/(?:intl-[a-z-]+\/)?(?:embed\/)?(?:user\/[^/?#]+\/)?(playlist|album|track|artist|show|episode)\/([A-Za-z0-9]{22})/;
+const URI = /^spotify:(?:user:[^:]+:)?(playlist|album|track|artist|show|episode):([A-Za-z0-9]{22})$/;
+const BARE_ID = /^[A-Za-z0-9]{22}$/;
+
+/** Devuelve el id (22 caracteres) de una playlist a partir de un enlace, URI o id suelto. */
+export function parsePlaylistId(input: string): string {
+  const text = input.trim();
+  if (!text) throw new ImportError('invalid_url', 'Pega un enlace de una playlist de Spotify.');
+  if (/^https?:\/\/spotify\.link\//i.test(text)) {
+    throw new ImportError('short_link', 'Los enlaces cortos (spotify.link) no se admiten: abre el enlace y copia el de open.spotify.com.');
+  }
+  const m = REF.exec(text) ?? URI.exec(text);
+  if (m) {
+    if (m[1] !== 'playlist') {
+      throw new ImportError('not_playlist', `Ese enlace es de tipo "${m[1]}", no de una playlist.`);
+    }
+    return m[2];
+  }
+  if (BARE_ID.test(text)) return text;
+  throw new ImportError('invalid_url', 'No reconozco ese enlace como una playlist de Spotify.');
+}
+</file>
+
+<file path="src/importers/errors.ts">
+export type ImportErrorCode =
+  | 'invalid_url' | 'not_playlist' | 'short_link' | 'network' | 'unavailable' | 'parse';
+
+export class ImportError extends Error {
+  constructor(public readonly code: ImportErrorCode, message: string) {
+    super(message);
+    this.name = 'ImportError';
+  }
+}
+</file>
+
+<file path="src/models/Track.ts">
+export type TrackVersion =
+  | 'studio'
+  | 'live'
+  | 'remix'
+  | 'acoustic'
+  | 'instrumental'
+  | 'karaoke'
+  | 'cover'
+  | 'altered'
+  | 'unknown';
+
+export interface Track {
+  /** Identidad interna estable, no dependiente de un proveedor. */
+  id: string;
+  title: string;
+  artists: string[];
+  album?: string;
+  durationMs?: number;
+  isrc?: string;
+  version: TrackVersion;
+  externalIds: {
+    spotify?: string;
+    youtubeVideo?: string;
+    musicBrainzRecording?: string;
+  };
+}
+
+export interface TrackCandidate {
+  provider: 'youtube' | 'musicbrainz';
+  externalId: string;
+  title: string;
+  artists: string[];
+  album?: string;
+  durationMs?: number;
+  isrc?: string;
+  version: TrackVersion;
+}
+</file>
+
+<file path="src/providers/youtubeMusic/search.ts">
+export interface YtResult {
+  videoId: string;
+  title: string;
+  artists: string[];
+  album?: string;
+  durationSec?: number;
+  kind: 'song' | 'video' | 'other';
+}
+
+export class SearchError extends Error {
+  constructor(public code: 'network' | 'parse', message: string) {
+    super(message);
+  }
+}
+
+// Filtro "Canciones" de YT Music (valor de ytmusicapi; NO verificado hoy).
+// Si no devuelve nada, el matching reintenta con filter:false.
+export const SONGS_FILTER = 'EgWKAQIIAWoMEA4QChADEAQQCRAF';
+const ENDPOINT = 'https://music.youtube.com/youtubei/v1/search?prettyPrint=false';
+
+export function buildQuery(title: string, artists: string[]): string {
+  return `${artists[0] ?? ''} ${title}`.trim();
+}
+
+export function buildSearchBody(query: string, params?: string) {
+  return {
+    context: { client: { clientName: 'WEB_REMIX', clientVersion: '1.20241127.01.00', hl: 'en' } },
+    query,
+    ...(params ? { params } : {}),
+  };
+}
+
+export function parseDuration(s: string): number | undefined {
+  const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})$/.exec(s.trim());
+  if (!m) return undefined;
+  return Number(m[1] ?? 0) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+type Json = any;
+
+function collectItems(node: Json, out: Json[]): void {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    node.forEach((n) => collectItems(n, out));
+    return;
+  }
+  if (node.musicResponsiveListItemRenderer) {
+    out.push(node.musicResponsiveListItemRenderer);
+    return;
+  }
+  Object.values(node).forEach((v) => collectItems(v, out));
+}
+
+function pageType(run: Json): string | undefined {
+  return run?.navigationEndpoint?.browseEndpoint?.browseEndpointContextSupportedConfigs
+    ?.browseEndpointContextMusicConfig?.pageType;
+}
+
+function findVideoId(node: Json): string | undefined {
+  if (!node || typeof node !== 'object') return undefined;
+  if (typeof node.videoId === 'string') return node.videoId;
+  for (const v of Object.values(node)) {
+    const f = findVideoId(v);
+    if (f) return f;
+  }
+  return undefined;
+}
+
+function parseItem(r: Json): YtResult | null {
+  const cols: Json[][] = (r.flexColumns ?? []).map(
+    (c: Json) => c?.musicResponsiveListItemFlexColumnRenderer?.text?.runs ?? [],
+  );
+  const title: string | undefined = cols[0]?.[0]?.text;
+  const videoId: string | undefined = r.playlistItemData?.videoId ?? findVideoId(r);
+  if (!title || !videoId) return null;
+
+  const runs: Json[] = cols[1] ?? [];
+  const artists: string[] = [];
+  let album: string | undefined;
+  let durationSec: number | undefined;
+  const segments: string[] = [];
+  let current = '';
+  for (const run of runs) {
+    const text: string = run?.text ?? '';
+    if (text.trim() === '•') {
+      segments.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += text;
+    const pt = pageType(run);
+    if (pt === 'MUSIC_PAGE_TYPE_ARTIST' || pt === 'MUSIC_PAGE_TYPE_USER_CHANNEL') artists.push(text);
+    else if (pt === 'MUSIC_PAGE_TYPE_ALBUM') album = text;
+    const d = parseDuration(text);
+    if (d !== undefined) durationSec = d;
+  }
+  if (current) segments.push(current.trim());
+
+  const first = segments[0]?.toLowerCase();
+  let kind: YtResult['kind'] = 'other';
+  if (first === 'song' || album) kind = 'song';
+  else if (first === 'video') kind = 'video';
+
+  if (artists.length === 0) {
+    const fallback = segments.find(
+      (s) => !/^(song|video|album|single|ep)$/i.test(s) && parseDuration(s) === undefined,
+    );
+    if (fallback) artists.push(fallback);
+  }
+  return { videoId, title, artists, album, durationSec, kind };
+}
+
+export function parseSearchResponse(json: unknown): YtResult[] {
+  const items: Json[] = [];
+  collectItems(json, items);
+  const seen = new Set<string>();
+  const results: YtResult[] = [];
+  for (const it of items) {
+    const p = parseItem(it);
+    if (p && !seen.has(p.videoId)) {
+      seen.add(p.videoId);
+      results.push(p);
+    }
+  }
+  return results;
+}
+
+export async function searchYtMusic(
+  query: string,
+  opts: { fetchFn?: typeof fetch; filter?: boolean } = {},
+): Promise<YtResult[]> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  let res: Response;
+  try {
+    res = await fetchFn(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://music.youtube.com' },
+      body: JSON.stringify(buildSearchBody(query, opts.filter === false ? undefined : SONGS_FILTER)),
+    });
+  } catch (e) {
+    throw new SearchError('network', `Sin conexión con YouTube Music: ${(e as Error).message}`);
+  }
+  if (!res.ok) throw new SearchError('network', `YouTube Music respondió ${res.status}`);
+  try {
+    return parseSearchResponse(await res.json());
+  } catch (e) {
+    throw new SearchError('parse', `Respuesta no válida: ${(e as Error).message}`);
+  }
+}
+</file>
+
+<file path="src/providers/youtubeMusic/toCandidate.ts">
+import { TrackCandidate } from '../../models/Track';
+import { parseTitle } from '../../core/matching/parseTitle';
+import { YtResult } from './search';
+
+/** Convierte un resultado de YouTube Music en candidato para scoreCandidate. */
+export function toCandidate(r: YtResult): TrackCandidate {
+  const { version } = parseTitle(r.title, r.artists);
+  return {
+    provider: 'youtube',
+    externalId: r.videoId,
+    title: r.title,
+    artists: r.artists,
+    album: r.album,
+    durationMs: r.durationSec !== undefined ? r.durationSec * 1000 : undefined,
+    version,
+  };
+}
+</file>
+
+<file path="tests/helpers/nodeSqliteDb.ts">
+/// <reference types="node" />
+import { DatabaseSync } from 'node:sqlite';
+import { Db, SqlParam } from '../../src/db/database';
+
+/** Adaptador para probar el repositorio en Node con SQLite en memoria. */
+export function createTestDb(): Db {
+  const db = new DatabaseSync(':memory:');
+  db.exec('PRAGMA foreign_keys = ON;');
+  const bind = (p?: SqlParam[]) => (p ?? []).map(v => (v === undefined ? null : v));
+  return {
+    async execAsync(sql) { db.exec(sql); },
+    async runAsync(sql, params) { return db.prepare(sql).run(...bind(params)); },
+    async getAllAsync<T>(sql: string, params?: SqlParam[]) { return db.prepare(sql).all(...bind(params)) as T[]; },
+    async getFirstAsync<T>(sql: string, params?: SqlParam[]) { return (db.prepare(sql).get(...bind(params)) as T | undefined) ?? null; },
+  };
+}
+</file>
+
+<file path="tests/db.test.ts">
+import { beforeEach, describe, expect, it } from 'vitest';
+import { Db } from '../src/db/database';
+import { migrate, SCHEMA_VERSION } from '../src/db/migrations';
+import {
+  getCachedVideoId, getMatchStatus, getPlaylistEntries, getTrack, listPendingReviews,
+  recordMatching, resolveManual, savePlaylist, upsertTrack, countByStatus, ScoredCandidate,
+} from '../src/db/repository';
+import { scoreCandidate } from '../src/core/matching/scoreCandidate';
+import { Track, TrackCandidate } from '../src/models/Track';
+import { createTestDb } from './helpers/nodeSqliteDb';
+
+const track = (id: string, o: Partial<Track> = {}): Track => ({
+  id, title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'], album: 'Shawn Mendes',
+  durationMs: 190000, version: 'studio', externalIds: { spotify: 'sp_' + id }, ...o,
+});
+const cand = (id: string, o: Partial<TrackCandidate> = {}): TrackCandidate => ({
+  provider: 'youtube', externalId: id, title: 'Señorita', artists: ['Shawn Mendes'],
+  durationMs: 190500, version: 'studio', ...o,
+});
+const score = (t: Track, c: TrackCandidate): ScoredCandidate => ({ candidate: c, result: scoreCandidate(t, c) });
+
+let db: Db;
+beforeEach(async () => { db = createTestDb(); await migrate(db); });
+
+describe('migraciones', () => {
+  it('son idempotentes y fijan la versión', async () => {
+    expect(await migrate(db)).toBe(SCHEMA_VERSION);
+    const v = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
+    expect(v?.user_version).toBe(SCHEMA_VERSION);
+  });
+});
+
+describe('canciones', () => {
+  it('guarda y recupera con artistas como lista', async () => {
+    await upsertTrack(db, track('a'));
+    expect(await getTrack(db, 'a')).toMatchObject({ title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'] });
+  });
+  it('misma canción de Spotify no se duplica y conserva su id', async () => {
+    const id1 = await upsertTrack(db, track('a'));
+    const id2 = await upsertTrack(db, track('b', { externalIds: { spotify: 'sp_a' }, title: 'Señorita (v2)' }));
+    expect(id2).toBe(id1);
+    expect((await getTrack(db, id1))?.title).toBe('Señorita (v2)');
+  });
+});
+
+describe('playlists', () => {
+  it('conserva el orden y reimportar actualiza en vez de duplicar', async () => {
+    await upsertTrack(db, track('a')); await upsertTrack(db, track('b', { title: 'Otra' }));
+    const pl = await savePlaylist(db, { name: 'Mi lista', spotifyId: 'pl1' }, ['b', 'a']);
+    expect((await getPlaylistEntries(db, pl)).map(e => e.track.id)).toEqual(['b', 'a']);
+    const again = await savePlaylist(db, { name: 'Mi lista 2', spotifyId: 'pl1' }, ['a']);
+    expect(again).toBe(pl);
+    expect(await getPlaylistEntries(db, pl)).toHaveLength(1);
+  });
+});
+
+describe('matching guardado', () => {
+  it('auto: guarda vídeo y alimenta la caché', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    const st = await recordMatching(db, 'a', [score(t, cand('vid1')), score(t, cand('vidX', { artists: ['Otro'] }))]);
+    expect(st).toBe('auto');
+    expect(await getCachedVideoId(db, 'sp_a')).toBe('vid1');
+  });
+  it('dudoso: queda pendiente con candidatos ordenados y sin caché', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    const st = await recordMatching(db, 'a', [
+      score(t, cand('v1', { durationMs: undefined })),
+      score(t, cand('v2', { durationMs: 193000 })),
+    ]);
+    expect(st).toBe('pending');
+    expect(await getCachedVideoId(db, 'sp_a')).toBeNull();
+    const [p] = await listPendingReviews(db);
+    expect(p.track.id).toBe('a');
+    expect(p.candidates.map(c => c.score)).toEqual([...p.candidates.map(c => c.score)].sort((x, y) => y - x));
+  });
+  it('sin candidatos válidos: none', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    expect(await recordMatching(db, 'a', [score(t, cand('v1', { artists: ['Otro'], title: 'Nada' }))])).toBe('none');
+  });
+  it('la decisión manual del usuario nunca se sobrescribe', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    await recordMatching(db, 'a', [score(t, cand('v1', { durationMs: undefined }))]);
+    await resolveManual(db, 'a', 'elegido');
+    expect(await recordMatching(db, 'a', [score(t, cand('vNuevo'))])).toBe('manual');
+    expect(await getMatchStatus(db, 'a')).toEqual({ status: 'manual', videoId: 'elegido' });
+    expect(await getCachedVideoId(db, 'sp_a')).toBe('elegido');
+    expect(await listPendingReviews(db)).toHaveLength(0);
+  });
+  it('contadores por estado', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    await recordMatching(db, 'a', [score(t, cand('vid1'))]);
+    expect(await countByStatus(db)).toEqual({ auto: 1 });
+  });
+});
+</file>
+
+<file path="tests/matching-cases.md">
+# Casos de prueba manuales del matching
+
+1. Mismo título, artista diferente: debe rechazarse, nunca autoimportarse.
+2. Mismo título y artista, duración muy distinta: debe revisarse o rechazarse.
+3. ISRC igual, artista y título coherentes: candidato de alta confianza.
+4. Versión original frente a versión live: nunca autoimportar.
+5. Falta ISRC (lo normal en YouTube): solo `auto` con artista principal + título exacto + duración ±2 s + misma versión; si falta la duración, `review`.
+6. Artista invitado: los `feat.` del título se extraen y cuentan como artistas; si solo coincide un artista secundario, nunca `auto`.
+7. Títulos con acentos, mayúsculas y signos: normalización equivalente.
+8. Dos grabaciones del mismo artista y título: comparar ISRC, duración, álbum y versión.
+</file>
+
+<file path="tests/scoreCandidate.test.ts">
+import { describe, expect, it } from 'vitest';
+import { normalize, scoreCandidate } from '../src/core/matching/scoreCandidate';
+import { Track, TrackCandidate } from '../src/models/Track';
+
+const track: Track = {
+  id: 't1', title: 'Señorita', artists: ['Shawn Mendes', 'Camila Cabello'],
+  album: 'Shawn Mendes', durationMs: 190000, isrc: 'USUM71900764',
+  version: 'studio', externalIds: {},
+};
+const cand = (o: Partial<TrackCandidate> = {}): TrackCandidate => ({
+  provider: 'youtube', externalId: 'v1', title: 'Señorita',
+  artists: ['Shawn Mendes'], durationMs: 190500, version: 'studio', ...o,
+});
+
+describe('normalize', () => {
+  it('quita tildes, mayúsculas y signos', () => {
+    expect(normalize('  Señor   CAFÉ! ')).toBe('senor cafe');
+    expect(normalize('Rock & Roll')).toBe('rock and roll');
+  });
+});
+
+describe('scoreCandidate', () => {
+  it('1. mismo título, artista distinto: nunca auto', () => {
+    const r = scoreCandidate(track, cand({ artists: ['Otro Artista'] }));
+    expect(r.decision).not.toBe('auto');
+    expect(r.conflicts).toContain('Artista no coincidente');
+  });
+  it('3. ISRC igual + metadatos coherentes: auto', () => {
+    const r = scoreCandidate(track, cand({ isrc: 'USUM71900764' }));
+    expect(r.decision).toBe('auto');
+  });
+  it('4. original vs live: nunca auto', () => {
+    const r = scoreCandidate(track, cand({ version: 'live', isrc: 'USUM71900764' }));
+    expect(r.decision).not.toBe('auto');
+  });
+  it('2. duración muy distinta: no auto', () => {
+    const r = scoreCandidate(track, cand({ durationMs: 260000, isrc: 'USUM71900764' }));
+    expect(r.decision).not.toBe('auto');
+  });
+  it('7. acentos/mayúsculas equivalentes en título', () => {
+    const r = scoreCandidate(track, cand({ title: 'SEÑORITA' }));
+    expect(r.reasons).toContain('Título coincidente');
+  });
+});
+
+describe('paso 2: versiones, feat. y títulos flexibles', () => {
+  const t: Track = { ...track, isrc: undefined, title: 'Señorita' };
+  it('"Artista - Título (Official Video)" se autoacepta si todo cuadra', () => {
+    const r = scoreCandidate(t, cand({ title: 'Shawn Mendes - Señorita (Official Video)', isrc: undefined }));
+    expect(r.decision).toBe('auto');
+  });
+  it('"(Live)" en el título de YouTube nunca es auto', () => {
+    const r = scoreCandidate(t, cand({ title: 'Señorita (Live at Wembley)', isrc: undefined }));
+    expect(r.conflicts).toContain('Versión diferente');
+    expect(r.decision).toBe('reject');
+  });
+  it('feat. en el título no rompe el match de título', () => {
+    const tr: Track = { ...t, title: 'Señorita (feat. Camila Cabello)' };
+    const r = scoreCandidate(tr, cand({ title: 'Señorita', isrc: undefined }));
+    expect(r.reasons).toContain('Título coincidente');
+  });
+  it('sped up / slowed se detecta como versión alterada', () => {
+    const r = scoreCandidate(t, cand({ title: 'Señorita (sped up)', isrc: undefined }));
+    expect(r.conflicts).toContain('Versión diferente');
+  });
+  it('sin duración no hay auto (solo revisión)', () => {
+    const r = scoreCandidate(t, cand({ durationMs: undefined, isrc: undefined }));
+    expect(r.decision).toBe('review');
+  });
+  it('re-grabación "(Taylor\'s Version)" no coincide con el original', () => {
+    const tr: Track = { ...t, title: 'Love Story', artists: ['Taylor Swift'] };
+    const r = scoreCandidate(tr, cand({ title: "Love Story (Taylor's Version)", artists: ['Taylor Swift'], isrc: undefined }));
+    expect(r.decision).not.toBe('auto');
+  });
+});
+</file>
+
+<file path="tests/spotify.test.ts">
+import { beforeEach, describe, expect, it } from 'vitest';
+import { Db } from '../src/db/database';
+import { migrate } from '../src/db/migrations';
+import { getPlaylistEntries } from '../src/db/repository';
+import { ImportError } from '../src/importers/errors';
+import { artistsFromSubtitle, parseEmbedHtml } from '../src/importers/spotify/embed';
+import { importSpotifyPlaylist } from '../src/importers/spotify/importPlaylist';
+import { parsePlaylistId } from '../src/importers/spotify/parseUrl';
+import { createTestDb } from './helpers/nodeSqliteDb';
+
+const PL = '37i9dQZF1DXcBWIGoYBM5M';
+const sid = (n: number) => String(n).padStart(22, 'A');
+const item = (n: number, o: Record<string, unknown> = {}) => ({
+  uri: `spotify:track:${sid(n)}`, title: `Canción ${n}`, subtitle: 'Artista Uno,\u00a0Artista Dos', duration: 200000 + n, ...o,
+});
+const html = (entity: unknown) =>
+  `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
+    props: { pageProps: { state: { data: { entity } } } },
+  })}</script></html>`;
+const okFetch = (body: string) => async () => ({ ok: true, status: 200, text: async () => body });
+
+const codeOf = (fn: () => unknown) => { try { fn(); } catch (e) { return (e as ImportError).code; } return null; };
+
+describe('parsePlaylistId', () => {
+  it.each([
+    [`https://open.spotify.com/playlist/${PL}`],
+    [`https://open.spotify.com/playlist/${PL}?si=abc123def`],
+    [`https://open.spotify.com/intl-es/playlist/${PL}`],
+    [`  https://open.spotify.com/embed/playlist/${PL}  `],
+    [`https://open.spotify.com/user/someone/playlist/${PL}`],
+    [`spotify:playlist:${PL}`],
+    [PL],
+  ])('acepta %s', input => expect(parsePlaylistId(input)).toBe(PL));
+
+  it('rechaza lo que no es una playlist', () => {
+    expect(codeOf(() => parsePlaylistId(`https://open.spotify.com/album/${PL}`))).toBe('not_playlist');
+    expect(codeOf(() => parsePlaylistId(`https://open.spotify.com/track/${PL}`))).toBe('not_playlist');
+    expect(codeOf(() => parsePlaylistId('https://spotify.link/abc123'))).toBe('short_link');
+    expect(codeOf(() => parsePlaylistId('hola'))).toBe('invalid_url');
+    expect(codeOf(() => parsePlaylistId(''))).toBe('invalid_url');
+  });
+});
+
+describe('parseEmbedHtml', () => {
+  it('lee nombre, canciones, artistas y duración', () => {
+    const r = parseEmbedHtml(html({ name: 'Mi lista', trackList: [item(1), item(2)] }));
+    expect(r.name).toBe('Mi lista');
+    expect(r.tracks).toHaveLength(2);
+    expect(r.tracks[0]).toEqual({ spotifyId: sid(1), title: 'Canción 1', artists: ['Artista Uno', 'Artista Dos'], durationMs: 200001 });
+    expect(r.partial).toBe(false);
+  });
+  it('omite archivos locales y episodios, y los cuenta', () => {
+    const r = parseEmbedHtml(html({ name: 'x', trackList: [item(1), item(2, { uri: 'spotify:local:a:b:c:d' }), item(3, { uri: `spotify:episode:${sid(3)}` })] }));
+    expect(r.tracks).toHaveLength(1);
+    expect(r.skipped).toBe(2);
+  });
+  it('avisa de lista parcial al llegar a 100', () => {
+    const list = Array.from({ length: 100 }, (_, i) => item(i + 1));
+    expect(parseEmbedHtml(html({ name: 'x', trackList: list })).partial).toBe(true);
+  });
+  it('tolera que trackList esté en otro sitio del JSON', () => {
+    const page = `<script id="__NEXT_DATA__">${JSON.stringify({ a: { b: { trackList: [item(1)] } } })}</script>`;
+    expect(parseEmbedHtml(page).tracks).toHaveLength(1);
+  });
+  it('errores claros: entidad nula y página sin datos', () => {
+    expect(codeOf(() => parseEmbedHtml(html(null)))).toBe('unavailable');
+    expect(codeOf(() => parseEmbedHtml('<html>nada</html>'))).toBe('parse');
+    expect(codeOf(() => parseEmbedHtml('<script id="__NEXT_DATA__">{roto</script>'))).toBe('parse');
+  });
+  it('artistas separados por coma, con espacios duros', () => {
+    expect(artistsFromSubtitle('A,\u00a0B, C')).toEqual(['A', 'B', 'C']);
+    expect(artistsFromSubtitle(undefined)).toEqual([]);
+  });
+});
+
+describe('importSpotifyPlaylist', () => {
+  let db: Db;
+  beforeEach(async () => { db = createTestDb(); await migrate(db); });
+  const page = html({ name: 'Mi lista', trackList: [item(1), item(2, { title: 'Tema (Live at Wembley)' }), item(3)] });
+
+  it('guarda canciones en orden, con versión detectada', async () => {
+    const s = await importSpotifyPlaylist(db, `https://open.spotify.com/playlist/${PL}`, okFetch(page));
+    expect(s).toMatchObject({ name: 'Mi lista', total: 3, newTracks: 3, partial: false });
+    const entries = await getPlaylistEntries(db, s.playlistId);
+    expect(entries.map(e => e.track.title)).toEqual(['Canción 1', 'Tema (Live at Wembley)', 'Canción 3']);
+    expect(entries[1].track.version).toBe('live');
+    expect(entries[0].track.version).toBe('studio');
+  });
+  it('reimportar no duplica ni canciones ni playlist', async () => {
+    const a = await importSpotifyPlaylist(db, PL, okFetch(page));
+    const b = await importSpotifyPlaylist(db, PL, okFetch(page));
+    expect(b.playlistId).toBe(a.playlistId);
+    expect(b.newTracks).toBe(0);
+    const n = await db.getFirstAsync<{ n: number }>('SELECT COUNT(*) AS n FROM tracks');
+    expect(n?.n).toBe(3);
+  });
+  it('una canción repetida en otra playlist reutiliza la misma fila', async () => {
+    await importSpotifyPlaylist(db, PL, okFetch(page));
+    const other = html({ name: 'Otra', trackList: [item(1), item(9)] });
+    const s = await importSpotifyPlaylist(db, 'A'.repeat(22), okFetch(other));
+    expect(s.newTracks).toBe(1);
+  });
+  it('traduce errores de red y de HTTP', async () => {
+    const boom = async () => { throw new Error('offline'); };
+    await expect(importSpotifyPlaylist(db, PL, boom)).rejects.toMatchObject({ code: 'network' });
+    const nf = async () => ({ ok: false, status: 404, text: async () => '' });
+    await expect(importSpotifyPlaylist(db, PL, nf)).rejects.toMatchObject({ code: 'unavailable' });
+    const e500 = async () => ({ ok: false, status: 500, text: async () => '' });
+    await expect(importSpotifyPlaylist(db, PL, e500)).rejects.toMatchObject({ code: 'network' });
+  });
+});
+</file>
+
+<file path="tests/youtubeMusic.test.ts">
+import { describe, it, expect } from 'vitest';
+import {
+  parseDuration,
+  parseSearchResponse,
+  searchYtMusic,
+  buildQuery,
+} from '../src/providers/youtubeMusic/search';
+
+const pageRun = (text: string, pageType: string) => ({
+  text,
+  navigationEndpoint: {
+    browseEndpoint: {
+      browseEndpointContextSupportedConfigs: {
+        browseEndpointContextMusicConfig: { pageType },
+      },
+    },
+  },
+});
+const artistRun = (t: string) => pageRun(t, 'MUSIC_PAGE_TYPE_ARTIST');
+const albumRun = (t: string) => pageRun(t, 'MUSIC_PAGE_TYPE_ALBUM');
+const item = (videoId: string, title: string, runs: any[]) => ({
+  musicResponsiveListItemRenderer: {
+    playlistItemData: { videoId },
+    flexColumns: [
+      { musicResponsiveListItemFlexColumnRenderer: { text: { runs: [{ text: title }] } } },
+      { musicResponsiveListItemFlexColumnRenderer: { text: { runs } } },
+    ],
+  },
+});
+
+const fixture = {
+  contents: {
+    tabbedSearchResultsRenderer: {
+      tabs: [
+        {
+          content: [
+            {
+              contents: [
+                item('AAA', 'Blinding Lights', [
+                  artistRun('The Weeknd'), { text: ' • ' }, albumRun('After Hours'), { text: ' • ' }, { text: '3:20' },
+                ]),
+                item('BBB', 'Blinding Lights (Live)', [
+                  { text: 'Video' }, { text: ' • ' }, artistRun('Fan Channel'), { text: ' • ' }, { text: '4:01' },
+                ]),
+                item('AAA', 'Duplicado', [artistRun('X'), { text: ' • ' }, { text: '1:00' }]),
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+};
+
+describe('youtube music search', () => {
+  it('parsea duraciones', () => {
+    expect(parseDuration('3:20')).toBe(200);
+    expect(parseDuration('1:02:03')).toBe(3723);
+    expect(parseDuration('Song')).toBeUndefined();
+  });
+
+  it('extrae canciones y vídeos, sin duplicar', () => {
+    const r = parseSearchResponse(fixture);
+    expect(r).toHaveLength(2);
+    expect(r[0]).toMatchObject({
+      videoId: 'AAA', title: 'Blinding Lights', artists: ['The Weeknd'],
+      album: 'After Hours', durationSec: 200, kind: 'song',
+    });
+    expect(r[1]).toMatchObject({ videoId: 'BBB', kind: 'video', durationSec: 241, artists: ['Fan Channel'] });
+  });
+
+  it('searchYtMusic usa fetch inyectado', async () => {
+    const fetchFn = (async () => ({ ok: true, status: 200, json: async () => fixture })) as any;
+    const r = await searchYtMusic(buildQuery('Blinding Lights', ['The Weeknd']), { fetchFn });
+    expect(r[0].videoId).toBe('AAA');
+  });
+
+  it('error de red', async () => {
+    const fetchFn = (async () => { throw new Error('x'); }) as any;
+    await expect(searchYtMusic('q', { fetchFn })).rejects.toMatchObject({ code: 'network' });
+  });
+});
+</file>
+
+<file path=".gitignore">
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+</file>
+
+<file path="AGENTS.md">
+This is an Expo/React Native mobile application. Prioritize mobile-first patterns, performance, and cross-platform compatibility.
+
+## Expo has changed — do not trust your training data
+
+Expo ships breaking changes every SDK release. APIs you remember are likely renamed, moved, or removed. Before writing any code that touches an Expo, EAS, or React Native API:
+
+1. Read the major version of the `expo` package in `package.json`.
+2. Fetch the matching versioned docs: `https://docs.expo.dev/versions/v<major>.0.0/`
+3. For anything else, fetch https://docs.expo.dev/llms.txt — an index of all Expo docs with corrections to common LLM misconceptions. Follow its links to the specific page you need; never answer from memory.
+
+## Commands
+
+Use `bunx` instead of `npx` if the project uses bun (`bun.lock` present).
+
+```bash
+npx expo install <package>  # ALWAYS use instead of npm/yarn/pnpm/bun add — resolves SDK-compatible versions
+npx expo start              # start the dev server
+npx expo lint               # lint
+npx tsc --noEmit            # typecheck
+npx expo-doctor             # diagnose dependency and config issues
+npx expo install --fix      # fix incompatible package versions
+```
+
+Run lint and typecheck before declaring any task done.
+
+## Navigation & Routing
+
+- Use **Expo Router** for all navigation. Routes live in `src/app/` — every file there is a screen, `_layout.tsx` files define navigators. Keep non-route code (components, hooks, utils) outside `src/app/`.
+- Import `Link`, `router`, and `useLocalSearchParams` from `expo-router`.
+- Docs: https://docs.expo.dev/router/introduction.md
+
+## Building with EAS
+
+Use EAS to build, sign, and submit the app in the cloud (`eas build`, `eas submit`) and to ship over-the-air updates (`eas update`) — no local Xcode or Android Studio required. Run EAS CLI as `bunx eas-cli <command>` in Bun projects, or `npx eas-cli@latest <command>` otherwise; substitute that for bare `eas` in docs examples.
+Docs: https://docs.expo.dev/eas/index.md
+
+## Rules
+
+- If `ios/` and `android/` directories do not exist, they are generated (Continuous Native Generation). Never create or edit them by hand — configure native behavior in `app.json` and config plugins.
+- Expo Go only includes its bundled native modules. After adding a library with native code, the app needs a development build: `npx expo run:ios|android` locally, or `eas build --profile development`.
+- Prefer recommended Expo modules over third-party libraries, and check your available skills before adding dependencies. Docs: https://docs.expo.dev/versions/latest/index.md
+</file>
+
+<file path="eas.json">
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal"
+    },
+    "production": {}
+  }
+}
+</file>
+
+<file path="index.ts">
+import { registerRootComponent } from 'expo';
+
+import App from './App';
+
+// registerRootComponent calls AppRegistry.registerComponent('main', () => App);
+// It also ensures that whether you load the app in Expo Go or in a native build,
+// the environment is set up appropriately
+registerRootComponent(App);
+</file>
+
+<file path="LICENSE">
+The MIT License (MIT)
+
+Copyright (c) 2015-present 650 Industries, Inc. (aka Expo)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</file>
+
+<file path="README.md">
+# Music Project (nombre provisional)
+
+Aplicación iOS de **uso personal** (no comercial): biblioteca musical, importación de playlists de Spotify y reproductor basado en YouTube. Objetivo principal: que cada canción importada sea la correcta, no una homónima de otro artista.
+
+## Estado
+Motor de matching probado (ISRC, artista, título, duración, versión). Aún sin persistencia, red ni interfaz real.
+
+## Puesta en marcha
+```bash
+npm install
+npx vitest run      # tests del matching (12)
+npx expo start
+```
+Para compilar iOS desde Windows: `npm i -g eas-cli`, `eas login`, `eas build:configure`, `eas build --platform ios --profile preview` (requiere cuenta Apple Developer para instalar en un iPhone físico).
+
+## Cómo funciona el matching
+Cada candidato recibe una puntuación y una decisión: `auto`, `review` o `reject`.
+- Nunca se autoacepta con conflicto de artista, versión, título, duración o ISRC.
+- Sin ISRC solo se autoacepta con artista principal, título exacto, duración ±2 s y misma versión.
+- Los títulos se limpian antes de comparar (feat., Official Video, Lyrics, Remastered, "Artista - ").
+- Live, remix, cover, sped up y re-grabaciones se tratan como versiones distintas.
+
+## Decisiones
+- Uso personal: se permiten vías no oficiales para buscar en YouTube (la cuota de la API oficial no alcanza para playlists grandes).
+- Secretos y tokens fuera del repositorio; tokens en SecureStore.
+- Identificadores de proveedor separados de la identidad interna de la canción.
+
+## Hitos
+1. ✅ Motor de matching y tests
+2. ✅ Parseo de títulos, versiones y feat.
+3. Persistencia SQLite y caché de coincidencias
+4. Importador de Spotify
+5. Búsqueda de candidatos en YouTube
+6. Pantalla de revisión de coincidencias
+7. Reproductor
+</file>
+
+<file path="tsconfig.json">
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true
+  }
+}
+</file>
+
+<file path="tests/matchQueue.test.ts">
+import { describe, it, expect } from 'vitest';
+import { Track } from '../src/models/Track';
+import { YtResult } from '../src/providers/youtubeMusic/search';
+import { findCandidates } from '../src/core/matching/matchTrack';
+import { runMatching } from '../src/core/matching/matchQueue';
+
+const track = (id: string, title = 'Blinding Lights', artist = 'The Weeknd'): Track => ({
+  id, title, artists: [artist], durationMs: 200000, version: 'studio', externalIds: {},
+});
+
+const good: YtResult = {
+  videoId: 'AAA', title: 'Blinding Lights', artists: ['The Weeknd'],
+  album: 'After Hours', durationSec: 200, kind: 'song',
+};
+const wrongArtist: YtResult = {
+  videoId: 'ZZZ', title: 'Blinding Lights', artists: ['Otro Artista'],
+  durationSec: 200, kind: 'song',
+};
+
+describe('findCandidates', () => {
+  it('ordena el candidato correcto primero y lo marca auto', async () => {
+    const r = await findCandidates(track('1'), async () => [wrongArtist, good]);
+    expect(r[0].candidate.externalId).toBe('AAA');
+    expect(r[0].result.decision).toBe('auto');
+    expect(r[1].result.decision).toBe('reject');
+  });
+
+  it('reintenta sin filtro si el filtrado no devuelve nada', async () => {
+    const calls: Array<boolean | undefined> = [];
+    const r = await findCandidates(track('1'), async (_q, o) => {
+      calls.push(o?.filter);
+      return o?.filter === false ? [good] : [];
+    });
+    expect(calls).toEqual([undefined, false]);
+    expect(r).toHaveLength(1);
+  });
+});
+
+describe('runMatching', () => {
+  const base = () => {
+    const recorded: string[] = [];
+    const sleeps: number[] = [];
+    return {
+      recorded, sleeps,
+      deps: {
+        search: async () => [good],
+        record: async (t: Track) => { recorded.push(t.id); },
+        sleep: async (ms: number) => { sleeps.push(ms); },
+        random: () => 0,
+      },
+    };
+  };
+
+  it('procesa, omite ya resueltas y pausa entre búsquedas', async () => {
+    const b = base();
+    const s = await runMatching([track('1'), track('2'), track('3')], {
+      ...b.deps, shouldSkip: async (t) => t.id === '2',
+    }, { delayMs: 100 });
+    expect(s).toMatchObject({ processed: 2, skipped: 1, auto: 2, errors: 0 });
+    expect(b.recorded).toEqual(['1', '3']);
+    expect(b.sleeps).toEqual([100]);
+  });
+
+  it('se detiene tras errores seguidos', async () => {
+    const b = base();
+    const s = await runMatching([track('1'), track('2'), track('3')], {
+      ...b.deps, search: async () => { throw new Error('bloqueado'); },
+    }, { maxConsecutiveErrors: 2 });
+    expect(s.stoppedByErrors).toBe(true);
+    expect(s.errors).toBe(2);
+  });
+
+  it('respeta la cancelación', async () => {
+    const b = base();
+    const s = await runMatching([track('1')], b.deps, { signal: { aborted: true } });
+    expect(s.aborted).toBe(true);
+    expect(b.recorded).toEqual([]);
+  });
+});
+</file>
+
+<file path="app.json">
+{
+  "expo": {
+    "name": "music-project",
+    "slug": "music-project",
+    "scheme": "musicproject",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.local.musicproject"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sqlite",
+      "expo-secure-store",
+      "expo-web-browser"
+    ]
+  }
+}
+</file>
+
+<file path="App.tsx">
+import React, { useEffect, useState } from 'react';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { Db } from './src/db/database';
+import { openDb } from './src/db/openDb';
+import { getPlaylistEntries, PlaylistEntry } from './src/db/repository';
+import { ImportError } from './src/importers/errors';
+import { importSpotifyPlaylist, ImportSummary } from './src/importers/spotify/importPlaylist';
+
+export default function App() {
+  const [db, setDb] = useState<Db | null>(null);
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [summary, setSummary] = useState<ImportSummary | null>(null);
+  const [entries, setEntries] = useState<PlaylistEntry[]>([]);
+
+  useEffect(() => {
+    openDb().then(setDb).catch(e => setError(`Error de base de datos: ${String(e)}`));
+  }, []);
+
+  const onImport = async () => {
+    if (!db || busy) return;
+    setBusy(true); setError(null); setMessage(null);
+    try {
+      const s = await importSpotifyPlaylist(db, url);
+      setSummary(s);
+      setEntries(await getPlaylistEntries(db, s.playlistId));
+      setMessage(
+        `${s.total} canciones importadas (${s.newTracks} nuevas).` +
+        (s.skipped ? ` ${s.skipped} omitidas (locales/episodios).` : '') +
+        (s.partial ? ' Aviso: Spotify solo expone las primeras 100; puede haber más en la playlist.' : ''),
+      );
+    } catch (e) {
+      setError(e instanceof ImportError ? e.message : `Error inesperado: ${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safe}>
+        <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+          <Text style={styles.eyebrow}>PROYECTO PRIVADO · V0.4</Text>
+          <Text style={styles.title}>Importar playlist</Text>
+          <View style={styles.card}>
+            <Text style={styles.body}>Pega el enlace de una playlist pública de Spotify.</Text>
+            <TextInput
+              style={styles.input} value={url} onChangeText={setUrl} placeholder="https://open.spotify.com/playlist/…"
+              placeholderTextColor="#5B6678" autoCapitalize="none" autoCorrect={false} keyboardType="url"
+            />
+            <Pressable style={[styles.button, (!db || busy || !url.trim()) && styles.buttonOff]} onPress={onImport}
+              disabled={!db || busy || !url.trim()}>
+              {busy ? <ActivityIndicator color="#0B0D12" /> : <Text style={styles.buttonText}>Importar</Text>}
+            </Pressable>
+            {message && <Text style={styles.ok}>{message}</Text>}
+            {error && <Text style={styles.err}>{error}</Text>}
+          </View>
+
+          {summary && (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>{summary.name}</Text>
+              {entries.slice(0, 15).map(e => (
+                <Text key={e.position} style={styles.body} numberOfLines={1}>
+                  {e.position + 1}. {e.track.title} — {e.track.artists.join(', ')}
+                </Text>
+              ))}
+              {entries.length > 15 && <Text style={styles.body}>… y {entries.length - 15} más</Text>}
+            </View>
+          )}
+        </ScrollView>
+      </SafeAreaView>
+    </SafeAreaProvider>
+  );
+}
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#0B0D12' },
+  container: { padding: 24, paddingTop: 24, gap: 18 },
+  eyebrow: { color: '#8D9AAF', fontSize: 11, letterSpacing: 2, fontWeight: '700' },
+  title: { color: '#FFFFFF', fontSize: 34, lineHeight: 40, fontWeight: '800' },
+  card: { backgroundColor: '#171C26', borderRadius: 18, padding: 18, gap: 12 },
+  cardTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700' },
+  body: { color: '#B6C0D0', fontSize: 14, lineHeight: 21 },
+  input: { backgroundColor: '#0B0D12', color: '#FFFFFF', borderRadius: 12, padding: 12, fontSize: 14 },
+  button: { backgroundColor: '#70D6A4', borderRadius: 12, padding: 14, alignItems: 'center' },
+  buttonOff: { opacity: 0.4 },
+  buttonText: { color: '#0B0D12', fontWeight: '800', fontSize: 15 },
+  ok: { color: '#70D6A4', fontSize: 13, fontWeight: '600' },
+  err: { color: '#FF8A8A', fontSize: 13, fontWeight: '600' },
+});
+</file>
+
+<file path="CONTEXT.md">
+# CONTEXT.md — Music Project (clon personal de Demus, mejorado)
+
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 4** (importador Spotify). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+
+## Objetivo
+App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
+
+## Stack y entorno
+- **Proyecto completo entregado (zip final, sin carpeta raíz, sin node_modules ni .git).** Generado con `create-expo-app@latest --template blank-typescript` y verificado: Expo SDK ~58.0.23, React 19.3.0, React Native 0.88.1, TypeScript ~6.0.3, vitest ^5.1.0, expo-sqlite ~58.0.15, expo-secure-store ~58.0.2, expo-auth-session ~58.0.17, expo-web-browser ~58.0.7. `app.json` ya tiene plugins (expo-sqlite, expo-secure-store, expo-web-browser), bundleIdentifier com.local.musicproject y scheme musicproject. Script `npm test` = `vitest run`. Tras `npm install`: 12 tests OK, `tsc --noEmit` OK.
+- Pasos para el usuario: copiar el contenido del zip a su carpeta vacía `C:\Users\ericm\MusicProject\music-project`, `npm install`, `npx vitest run`, `npx expo start`. Pendiente de rellenar: `extra.eas.projectId` (al hacer `eas build:configure`).
+- Expo (React Native) + TypeScript estricto, desarrollo desde Windows, build con EAS. Plugins en app.json: expo-sqlite, expo-secure-store.
+- Repo del usuario: github.com/Eriicmans/music-project (mi herramienta no puede abrirlo; se trabaja con el zip que sube el usuario).
+- Tests: Vitest (`npm i -D vitest`, `npx vitest run`). En mi sandbox hay que sustituir temporalmente `tsconfig.json` porque extiende `expo/tsconfig.base`.
+
+## Incidencias resueltas
+- Expo Go (iPhone) mostró: "signed in to Expo Go as ericmans, but not signed in to Expo CLI". Solución: `npx expo login` en el PC con la misma cuenta (ericmans), o cerrar sesión en Expo Go. Después el usuario dijo que `expo login` no pide contraseña y le lleva a su cuenta/pantalla de inicio de Expo Go: comprobar con `npx expo whoami`; si sale ericmans el login funcionó y el proyecto debe aparecer en Expo Go > Inicio > 'Development servers' (misma cuenta y misma wifi, o `--tunnel`). Si el móvil y el PC no comparten red: `npx expo start --tunnel`. En Windows (cmd), `npx expo login` por navegador falló (cmd `start` no abre la URL con `&`; Node v24.22.1): alternativas = `npx expo login -u ericmans` (pide contraseña en terminal), token `EXPO_TOKEN` creado en expo.dev/settings/access-tokens, o cerrar sesión en Expo Go.
+
+## Reinicio desde cero (decidido por el usuario tras fallar el arranque con Expo Go)
+- El usuario recrea el proyecto Expo en su PC con `npx create-expo-app@latest music-project --template blank-typescript`, tras mover a una carpeta `guardado` sus archivos propios: `src/`, `tests/`, `eas.json`, `CONTEXT.md`, `README.md` (copia de seguridad también en `music-project-completo.zip`).
+- **Orden:** 1) comprobar que la app en blanco arranca en el iPhone (Expo Go con sesión cerrada, o `npx expo login`; `npx expo start`, QR con la cámara; si falla, `--tunnel`). 2) SOLO entonces reincorporar archivos y dependencias: `npx expo install expo-sqlite expo-secure-store expo-auth-session expo-web-browser`, `npm i -D vitest`, añadir a app.json `"plugins": ["expo-sqlite","expo-secure-store","expo-web-browser"]`, `"scheme": "musicproject"`, `ios.bundleIdentifier` com.local.musicproject, y script `"test": "vitest run"`; copiar `src/`, `tests/`, `eas.json`; `npx vitest run` (12 tests). 3) Reconectar con GitHub (pendiente: decidir si conservar `.git` antiguo).
+- **Corrección:** con Expo Go actual (SDK 58) NO vale cerrar sesión en Expo Go: el mensaje es 'You need to be signed in to Expo Go and Expo CLI to open your project'. Hay que estar logueado en AMBOS con la misma cuenta (ericmans). Como `npx expo login` por navegador falla en su Windows, vía recomendada: token `EXPO_TOKEN` (expo.dev/settings/access-tokens; `set EXPO_TOKEN=...` en cmd; verificar con `npx expo whoami`) + iniciar sesión en Expo Go con la misma cuenta.
+- **Estado:** el usuario confirmó 'todo listo' (login resuelto, app en blanco asumida funcionando). Se le dieron los comandos para reincorporar `src/`, `tests/`, `eas.json`, `CONTEXT.md`, `README.md` desde `C:\\Users\\ericm\\MusicProject\\guardado` (xcopy/copy), instalar dependencias, editar app.json/package.json a mano y correr `npx vitest run`. Pendiente: que confirme 12 tests OK y que la app sigue arrancando.
+- No avanzar al paso 3 (SQLite) hasta confirmar que la app arranca.
+
+## Decisiones tomadas
+- **Entrega de archivos:** se entregó UN zip final (sin carpeta raíz, sin package.json/app.json/tsconfig.json/App.tsx/assets, que son los generados por Expo del usuario) para volcar el contenido en su carpeta. Desde ahí, solo archivos sueltos con ruta exacta. Antes de eso: NO dar zips (el usuario no quiere sustituir su carpeta). Dar solo archivos nuevos/modificados con su ruta exacta. Su carpeta local es la generada por `create-expo-app` (tiene assets/, node_modules/, AGENTS.md, package.json, tsconfig.json, app.json, index.ts, App.tsx propios, .gitignore, LICENSE). **Nunca pedirle sobrescribir** package.json, tsconfig.json, app.json ni App.tsx: indicar cambios puntuales (p. ej. añadir plugins a app.json).
+- Uso personal: el usuario autoriza **saltarse la regla "solo integraciones oficiales"** del README (búsqueda en YouTube por vías no oficiales, p. ej. ytmusicapi/youtubei). Motivo: `search.list` oficial cuesta 100 uds y la cuota diaria es 10.000 (~100 búsquedas/día; una playlist de 200 no cabe; **verificar en docs actuales**).
+- Reproducción: pendiente de decidir (iframe embebido oficial vs. otras vías). No se ha implementado nada.
+- El usuario pidió que el README se entregue **como texto en el chat**, no en archivo (el README del zip puede estar desactualizado).
+- Estilo de trabajo: implementar **paso a paso**, respuestas cortas, y devolver este CONTEXT.md actualizado en cada respuesta.
+
+## Estado actual del código
+- `src/models/Track.ts`: `Track`, `TrackCandidate`, `TrackVersion` = studio|live|remix|acoustic|instrumental|karaoke|cover|altered|unknown.
+- `src/core/matching/parseTitle.ts`: `parseTitle(raw, knownArtists)` → `{baseTitle, version, featured}`; quita ruido de YouTube (Official Video, Lyrics, Remastered, Radio Edit…), extrae `feat.`, detecta versión, quita prefijo "Artista - ". `splitArtists`, `titleSimilarity` (Dice sobre bigramas).
+- `src/core/matching/scoreCandidate.ts`: `normalize` (corregido bug de barras invertidas dobles que no quitaba tildes), `scoreCandidate(track, candidate)` → `{score, decision: auto|review|reject, reasons, conflicts, warnings}`.
+  - Puntos: ISRC exacto +40, artista principal +25 (secundario +12 con warning), título exacto +15 (similar ≥0.85 +10 con warning), duración ≤2 s +10 (≤5 s +5), versión igual +10.
+  - `auto`: sin conflictos ni warnings, artista principal coincide, y (ISRC exacto con score ≥90) **o** (sin ISRC: título exacto + duración ±2 s + misma versión). **Decisión mía:** sin ISRC sí se autoacepta con metadatos estrictos, porque YouTube casi nunca trae ISRC y si no todo iría a revisión (relaja el caso 5 de `tests/matching-cases.md`).
+  - `review`: sin conflicto de artista/versión/ISRC y score ≥ 40. Resto: `reject`.
+- `tests/scoreCandidate.test.ts`: 12 tests pasando (casos 1,2,3,4,7 del md + feat., live, sped up, sin duración, Taylor's Version).
+- **Paso 3 (SQLite), hecho y probado (21 tests, tsc OK):**
+  - `src/db/database.ts`: interfaz `Db` (execAsync, runAsync, getAllAsync, getFirstAsync; compatible con expo-sqlite) para poder testear en Node.
+  - `src/db/migrations.ts`: `migrate(db)` con `PRAGMA user_version`, transaccional; `SCHEMA_VERSION`=1. Tablas: `tracks` (spotify_id UNIQUE), `playlists` (spotify_id UNIQUE), `playlist_tracks` (PK playlist_id+position), `candidates` (PK track_id+provider+external_id; guarda score/decision/reasons/conflicts/warnings), `matches` (track_id PK, video_id, status auto|manual|pending|none, score).
+  - `src/db/openDb.ts`: `openDb()` singleton con expo-sqlite (`music.db`, WAL, foreign_keys ON) + migraciones.
+  - `src/db/repository.ts`: `upsertTrack` (no duplica por spotify_id), `getTrack`, `savePlaylist` (reimportar actualiza), `getPlaylistEntries`, `getCachedVideoId(spotifyId)` (solo auto/manual), `getMatchStatus`, `recordMatching(trackId, scored[])` (guarda hasta 5 candidatos no rechazados; auto→match auto; si no, pending; si nada, none; **nunca pisa un manual**), `resolveManual`, `listPendingReviews`, `countByStatus`, `newId`.
+  - `tests/db.test.ts` + `tests/helpers/nodeSqliteDb.ts` (adaptador sobre `node:sqlite`, requiere Node ≥22.13; emite un ExperimentalWarning inocuo). Requiere `npm i -D @types/node` (TS 6 ya no carga @types automáticamente; el helper usa `/// <reference types="node" />`).
+  - `App.tsx` de verificación: abre la BD y muestra "Base de datos lista · esquema v1" y contadores. Sin UI real todavía.
+
+## Paso 4 — Importador de Spotify (hecho; 39 tests, tsc OK; NO verificado contra Spotify real)
+- **Investigación (nov 2026):** desde feb 2026 la Web API oficial de Spotify en Developer Mode solo devuelve los items de playlists cuyo dueño/colaborador es el usuario; Client Credentials ya no sirve para playlists; Developer Mode exige Premium y pocos usuarios. Pegar un enlace público ajeno NO es posible por la vía oficial. Playlists propias vía OAuth PKCE sí darían lista completa con ISRC (opción futura).
+- **Vía elegida (no oficial, uso personal):** página embed pública `https://open.spotify.com/embed/playlist/{id}` → JSON en `<script id="__NEXT_DATA__">` → `entity.trackList` (uri, title, subtitle=artistas separados por coma/nbsp, duration en ms). Limitaciones: **máx. ~100 canciones**, **sin ISRC ni álbum**, no documentada (puede romperse). No se implementó la paginación vía GraphQL interno (`pathfinder`) porque no se pudo verificar el hash de la consulta persistida y fuentes se contradicen sobre si sigue funcionando. Para listas >100: copiar la playlist a una propia/dividirla, u OAuth PKCE más adelante.
+- Código: `src/importers/errors.ts` (`ImportError` con códigos invalid_url|not_playlist|short_link|network|unavailable|parse), `src/importers/spotify/parseUrl.ts` (`parsePlaylistId`: enlaces open/play/embed, intl-xx, user/x/playlist, URI, id suelto; rechaza álbum/pista/spotify.link), `embed.ts` (`parseEmbedHtml`, `fetchEmbedPlaylist`, tolerante a cambios con búsqueda recursiva de `trackList`; omite locales/episodios; `partial` si ≥100), `importPlaylist.ts` (`importSpotifyPlaylist(db, url, fetchFn=fetch)` → `{playlistId,name,total,newTracks,skipped,partial}`; versión de la canción vía `parseTitle`; transacción; reimportar no duplica).
+- `App.tsx` ahora tiene pantalla V0.4: caja de enlace + botón Importar + resumen + primeras 15 canciones. Usa `react-native-safe-area-context` (instalar con `npx expo install react-native-safe-area-context`; elimina el warning de SafeAreaView deprecado).
+- **Pendiente:** el usuario debe probar con una playlist real de Spotify en el iPhone; si falla ("parse"/"unavailable") pedirle el mensaje y, si puede, el HTML/JSON de la página embed para ajustar el parser.
+
+## Limitaciones conocidas del matching
+- `splitArtists` divide por `&`, `and`, `x`, `y`, `,`: nombres como "Earth, Wind & Fire" generan partes sueltas (puede dar coincidencias parciales falsas; lo compensa que el principal debe coincidir para `auto`).
+- Descripciones de YouTube/canales "Topic" aún no se usan como señal.
+
+## Plan de pasos
+1–4. ✅ (matching, parseo, SQLite, importador Spotify)
+5a. ✅ Búsqueda YT Music (`src/providers/youtubeMusic/search.ts`; NO verificado contra red real)
+5b. ✅ (lógica; 60 tests OK, tsc OK; test de pausas corregido a [100]) `toCandidate`, `findCandidates`, `runMatching` (cola con pausas). ⏭ Falta enlazar con `repository.recordMatching` y botón en App.tsx (necesita ver repository.ts y App.tsx)
+6. Pantalla de revisión (2-3 mejores candidatos por canción dudosa)
+7. Reproductor
+
+## Pasos 5a/5b — Búsqueda YouTube Music y cola de matching
+- Endpoint interno POST music.youtube.com/youtubei/v1/search (WEB_REMIX, sin cuota). `SONGS_FILTER` de ytmusicapi no verificado: si no devuelve nada, `findCandidates` reintenta con `filter:false` y descarta kind 'other'.
+- `toCandidate(YtResult)` → `TrackCandidate` (version vía parseTitle, durationMs = sec*1000).
+- `findCandidates(track, search)` → `ScoredCandidate[] {candidate,result}` ordenado (auto > review > reject, luego score).
+- `runMatching(tracks, {search, record, shouldSkip, sleep, random}, {delayMs=800 + hasta 50 %, maxConsecutiveErrors=5, onProgress, signal})` → resumen. `record` se adapta a `recordMatching` (formato de `scored` por confirmar con repository.ts).
+- Entrega: el usuario recibe archivos completos con ruta y los sustituye; no pegar fragmentos.
+
+## Siguiente sesión — Paso 5c (enlazar BD + UI)
+- Pedir al usuario que pegue `src/db/repository.ts` y su `App.tsx` actual (no los tengo; no adivinar firmas).
+- Entregar como ARCHIVOS completos: `repository.ts`/adaptador (`record` → `recordMatching`, `shouldSkip` → `getMatchStatus`/`getCachedVideoId`) y `App.tsx` con botón "Buscar coincidencias" (usa `runMatching`, `searchYtMusic`, progreso y cancelación). Opcional: botón de prueba para ver qué devuelve YT Music real y verificar `SONGS_FILTER`.
+- Luego paso 6 (pantalla de revisión) y 7 (reproductor).
+- Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project` (en la carpeta padre npx descarga un `tsc` falso).
+
+## Pendiente de preguntar / decidir
+- Método de reproducción en iOS (afecta a segundo plano).
+- Si hay que tocar `README.md`, `app.json` (projectId EAS) o añadir `package.json` al repo.
+</file>
+
+<file path="package.json">
+{
+  "name": "music-project",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "dependencies": {
+    "expo": "~58.0.23",
+    "expo-auth-session": "~58.0.17",
+    "expo-secure-store": "~58.0.2",
+    "expo-sqlite": "~58.0.15",
+    "expo-status-bar": "~58.0.4",
+    "expo-web-browser": "~58.0.7",
+    "react": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-safe-area-context": "~5.11.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "typescript": "~6.0.3",
+    "vitest": "^5.1.0"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "test": "vitest run"
+  },
+  "private": true
+}
+</file>
+
+</files>

@@ -4,6 +4,7 @@ import { migrate, SCHEMA_VERSION } from '../src/db/migrations';
 import {
   getCachedVideoId, getMatchStatus, getPlaylistEntries, getTrack, listPendingReviews,
   recordMatching, resolveManual, savePlaylist, upsertTrack, countByStatus, ScoredCandidate,
+  getChosenVideos, markNone,
 } from '../src/db/repository';
 import { scoreCandidate } from '../src/core/matching/scoreCandidate';
 import { Track, TrackCandidate } from '../src/models/Track';
@@ -90,5 +91,28 @@ describe('matching guardado', () => {
     const t = track('a'); await upsertTrack(db, t);
     await recordMatching(db, 'a', [score(t, cand('vid1'))]);
     expect(await countByStatus(db)).toEqual({ auto: 1 });
+  });
+});
+describe('revisión manual', () => {
+  it('getChosenVideos devuelve el vídeo auto y el elegido a mano', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    const pl = await savePlaylist(db, { name: 'L', spotifyId: 'pl1' }, ['a']);
+    await recordMatching(db, 'a', [score(t, cand('vid1'))]);
+    expect((await getChosenVideos(db, pl)).a).toMatchObject({ title: 'Señorita', artists: ['Shawn Mendes'] });
+
+    const t2 = track('b', { title: 'Otra' }); await upsertTrack(db, t2);
+    const pl2 = await savePlaylist(db, { name: 'L2', spotifyId: 'pl2' }, ['b']);
+    await recordMatching(db, 'b', [score(t2, cand('v1', { title: 'Otra', durationMs: undefined })), score(t2, cand('v2', { title: 'Otra', durationMs: 193000 }))]);
+    expect((await getChosenVideos(db, pl2)).b).toBeUndefined();
+    await resolveManual(db, 'b', 'v2');
+    expect((await getChosenVideos(db, pl2)).b).toMatchObject({ title: 'Otra', durationMs: 193000 });
+  });
+  it('markNone saca la canción de pendientes', async () => {
+    const t = track('a'); await upsertTrack(db, t);
+    await recordMatching(db, 'a', [score(t, cand('v1', { durationMs: undefined }))]);
+    expect(await listPendingReviews(db)).toHaveLength(1);
+    await markNone(db, 'a');
+    expect(await listPendingReviews(db)).toHaveLength(0);
+    expect(await getMatchStatus(db, 'a')).toEqual({ status: 'none', videoId: null });
   });
 });

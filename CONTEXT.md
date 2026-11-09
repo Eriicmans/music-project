@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 4** (importador Spotify). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 7** (reproductor v1). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -25,7 +25,7 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 ## Decisiones tomadas
 - **Entrega de archivos:** se entregó UN zip final (sin carpeta raíz, sin package.json/app.json/tsconfig.json/App.tsx/assets, que son los generados por Expo del usuario) para volcar el contenido en su carpeta. Desde ahí, solo archivos sueltos con ruta exacta. Antes de eso: NO dar zips (el usuario no quiere sustituir su carpeta). Dar solo archivos nuevos/modificados con su ruta exacta. Su carpeta local es la generada por `create-expo-app` (tiene assets/, node_modules/, AGENTS.md, package.json, tsconfig.json, app.json, index.ts, App.tsx propios, .gitignore, LICENSE). **Nunca pedirle sobrescribir** package.json, tsconfig.json, app.json ni App.tsx: indicar cambios puntuales (p. ej. añadir plugins a app.json).
 - Uso personal: el usuario autoriza **saltarse la regla "solo integraciones oficiales"** del README (búsqueda en YouTube por vías no oficiales, p. ej. ytmusicapi/youtubei). Motivo: `search.list` oficial cuesta 100 uds y la cuota diaria es 10.000 (~100 búsquedas/día; una playlist de 200 no cabe; **verificar en docs actuales**).
-- Reproducción: pendiente de decidir (iframe embebido oficial vs. otras vías). No se ha implementado nada.
+- Reproducción: DECIDIDO empezar con el iframe oficial (menos frágil); el usuario quiere poder cambiar luego a una vía no oficial con segundo plano. Por eso solo `src/ui/YouTubePlayer.tsx` conoce el motor. No se pudo confirmar qué usa Demus (búsqueda sin resultado).
 - El usuario pidió que el README se entregue **como texto en el chat**, no en archivo (el README del zip puede estar desactualizado).
 - Estilo de trabajo: implementar **paso a paso**, respuestas cortas, y devolver este CONTEXT.md actualizado en cada respuesta.
 
@@ -59,9 +59,10 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 ## Plan de pasos
 1–4. ✅ (matching, parseo, SQLite, importador Spotify)
 5a. ✅ Búsqueda YT Music (`src/providers/youtubeMusic/search.ts`; NO verificado contra red real)
-5b. ✅ (lógica) `toCandidate`, `findCandidates`, `runMatching` (cola con pausas). ⏭ Falta enlazar con `repository.recordMatching` y botón en App.tsx (necesita ver repository.ts y App.tsx)
-6. Pantalla de revisión (2-3 mejores candidatos por canción dudosa)
-7. Reproductor
+5b. ✅ (lógica; 60 tests OK, tsc OK; test de pausas corregido a [100]) `toCandidate`, `findCandidates`, `runMatching` (cola con pausas). ✅ enlazado en 5c
+5c. ✅ Enlace BD + botón en App.tsx
+6. ✅ Pantalla de revisión
+7. ✅ Reproductor v1 (iframe oficial; sin segundo plano)
 
 ## Pasos 5a/5b — Búsqueda YouTube Music y cola de matching
 - Endpoint interno POST music.youtube.com/youtubei/v1/search (WEB_REMIX, sin cuota). `SONGS_FILTER` de ytmusicapi no verificado: si no devuelve nada, `findCandidates` reintenta con `filter:false` y descarta kind 'other'.
@@ -69,6 +70,27 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - `findCandidates(track, search)` → `ScoredCandidate[] {candidate,result}` ordenado (auto > review > reject, luego score).
 - `runMatching(tracks, {search, record, shouldSkip, sleep, random}, {delayMs=800 + hasta 50 %, maxConsecutiveErrors=5, onProgress, signal})` → resumen. `record` se adapta a `recordMatching` (formato de `scored` por confirmar con repository.ts).
 - Entrega: el usuario recibe archivos completos con ruta y los sustituye; no pegar fragmentos.
+
+## Paso 5c — Enlace BD + UI (hecho; sin ejecutar en este entorno, NO verificado en dispositivo)
+- `src/db/matchingAdapter.ts`: `makeQueueDeps(db, search)` → `QueueDeps` (`record` → `recordMatching`; `shouldSkip` = estado auto/manual/pending; las `none` se reintentan).
+- `App.tsx` V0.5: importar → botón "Buscar coincidencias" (progreso, cancelar, contadores ✅auto 👆manual ❓pending ✖️none, icono por canción) + botón "Probar YT Music" que muestra el JSON parseado de una búsqueda real (sirve para verificar `SONGS_FILTER`).
+- **Pendiente del usuario:** `npx tsc --noEmit` y `npx vitest run` en su carpeta; probar en iPhone y reportar qué sale en "Probar YT Music" y el resumen del matching.
+
+## Paso 6 — Pantalla de revisión (hecho; NO ejecutado en este entorno)
+- `repository.ts`: nuevas `getChosenVideos(db, playlistId)` (vídeo auto/manual por canción, vía join con `candidates`) y `markNone(db, trackId)` ("ninguno es correcto"; una nueva búsqueda puede reintentarla). Tests añadidos en `tests/db.test.ts` (debería ser 62).
+- `src/ui/ReviewScreen.tsx`: una canción pendiente cada vez, hasta 3 candidatos (título, artistas, duración, puntos, motivos/avisos), botones Elegir (→ `resolveManual`), Escuchar (abre YT Music), Ninguno es correcto, Saltar.
+- `App.tsx` V0.6: cada fila muestra "↳ vídeo elegido"; botón "Revisar dudosas (N)" si hay pendientes; contadores cargados al abrir la BD.
+- La playlist de prueba del usuario salió toda ✅, así que la pantalla de revisión aún no se ha visto con datos reales.
+
+## Paso 7 — Reproductor v1 (hecho; NO ejecutado en este entorno)
+- Dependencias nuevas: `npx expo install react-native-webview` y `npm i react-native-youtube-iframe`.
+- `src/core/player/queue.ts` (`buildQueue`, `stepIndex`; `tests/queue.test.ts`, 2 tests), `src/ui/YouTubePlayer.tsx` (único acoplado a react-native-youtube-iframe; props videoId/playing/onEnded/onError/onPlayingChange), `App.tsx` V0.7: "▶ Reproducir playlist", tocar una canción con vídeo la reproduce, barra con ⏮ ⏯ ⏭ ✕, siguiente automático al terminar, salta si el vídeo no es embebible.
+- Limitaciones: se pausa con la pantalla bloqueada/app en segundo plano (WebView); el reproductor se detiene al entrar en la pantalla de revisión. Fase siguiente posible: segundo plano (dev build + modo audio, o motor no oficial reescribiendo solo YouTubePlayer).
+
+## Siguiente sesión
+- Si YT Music falla: ajustar `search.ts` según la salida del botón de prueba.
+- Paso 7: reproductor.
+- Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project`.
 
 ## Pendiente de preguntar / decidir
 - Método de reproducción en iOS (afecta a segundo plano).

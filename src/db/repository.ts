@@ -187,3 +187,25 @@ export async function countByStatus(db: Db): Promise<Record<string, number>> {
   for (const r of rows) out[r.status] = r.n;
   return out;
 }
+
+export interface ChosenVideo { title: string; artists: string[]; durationMs?: number }
+
+/** Vídeo elegido (auto o manual) de cada canción de una playlist, indexado por id de canción. */
+export async function getChosenVideos(db: Db, playlistId: string): Promise<Record<string, ChosenVideo>> {
+  const rows = await db.getAllAsync<{ track_id: string; title: string; artists: string; duration_ms: number | null }>(
+    `SELECT pt.track_id, c.title, c.artists, c.duration_ms
+     FROM playlist_tracks pt
+     JOIN matches m ON m.track_id = pt.track_id AND m.status IN ('auto','manual') AND m.video_id IS NOT NULL
+     JOIN candidates c ON c.track_id = m.track_id AND c.provider = 'youtube' AND c.external_id = m.video_id
+     WHERE pt.playlist_id = ?`, [playlistId]);
+  const out: Record<string, ChosenVideo> = {};
+  for (const r of rows) {
+    out[r.track_id] = { title: r.title, artists: JSON.parse(r.artists) as string[], durationMs: r.duration_ms ?? undefined };
+  }
+  return out;
+}
+
+/** El usuario descarta todos los candidatos de una canción (queda 'none'; una nueva búsqueda puede reintentarla). */
+export async function markNone(db: Db, trackId: string): Promise<void> {
+  await setMatch(db, trackId, 'none', null, null);
+}
