@@ -55,7 +55,9 @@ export async function getTrack(db: Db, id: string): Promise<Track | null> {
 
 /**
  * Guarda una playlist y el orden de sus canciones. Reimportar la misma playlist
- * (mismo spotifyId) la actualiza en vez de duplicarla.
+ * (mismo spotifyId) la actualiza en vez de duplicarla. Al reimportar:
+ *  - las canciones añadidas a mano (sin id de Spotify) se conservan al final;
+ *  - las canciones que ya no están en Spotify y no pertenecen a otra playlist se borran.
  */
 export async function savePlaylist(
   db: Db,
@@ -68,7 +70,16 @@ export async function savePlaylist(
   }
   await db.execAsync('BEGIN');
   try {
+    let finalIds = trackIds;
+    let previous: string[] = [];
     if (id) {
+      previous = (await db.getAllAsync<{ track_id: string }>(
+        'SELECT track_id FROM playlist_tracks WHERE playlist_id = ?', [id])).map(r => r.track_id);
+      const manual = await db.getAllAsync<{ track_id: string }>(
+        `SELECT pt.track_id FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
+         WHERE pt.playlist_id = ? AND t.spotify_id IS NULL ORDER BY pt.position`, [id]);
+      const kept = manual.map(r => r.track_id).filter(t => !trackIds.includes(t));
+      finalIds = [...trackIds, ...kept];
       await db.runAsync('UPDATE playlists SET name=?, source_url=? WHERE id=?', [playlist.name, playlist.sourceUrl ?? null, id]);
       await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [id]);
     } else {
@@ -76,15 +87,56 @@ export async function savePlaylist(
       await db.runAsync('INSERT INTO playlists (id, spotify_id, name, source_url, created_at) VALUES (?,?,?,?,?)',
         [id, playlist.spotifyId ?? null, playlist.name, playlist.sourceUrl ?? null, now()]);
     }
-    for (let i = 0; i < trackIds.length; i++) {
-      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, trackIds[i]]);
+    for (let i = 0; i < finalIds.length; i++) {
+      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [id, i, finalIds[i]]);
     }
+    await deleteOrphans(db, previous.filter(t => !finalIds.includes(t)));
     await db.execAsync('COMMIT');
   } catch (error) {
     await db.execAsync('ROLLBACK');
     throw error;
   }
   return id;
+}
+
+/** Borra, de entre las canciones indicadas, las que ya no están en ninguna playlist (cascada a coincidencias y candidatos). */
+async function deleteOrphans(db: Db, trackIds: string[]): Promise<void> {
+  for (const t of trackIds) {
+    await db.runAsync('DELETE FROM tracks WHERE id = ? AND id NOT IN (SELECT track_id FROM playlist_tracks)', [t]);
+  }
+}
+
+/** Cambia el nombre de una playlist. */
+export async function renamePlaylist(db: Db, playlistId: string, name: string): Promise<void> {
+  const clean = name.trim();
+  if (!clean) throw new Error('El nombre de la playlist no puede estar vacío');
+  await db.runAsync('UPDATE playlists SET name = ? WHERE id = ?', [clean, playlistId]);
+}
+
+/**
+ * Quita la canción que ocupa `position` en la playlist y recompone las posiciones.
+ * Si la canción no está en ninguna otra playlist, se borra con sus coincidencias.
+ * Devuelve false si no había nada en esa posición.
+ */
+export async function removeTrackFromPlaylist(db: Db, playlistId: string, position: number): Promise<boolean> {
+  await db.execAsync('BEGIN');
+  try {
+    const rows = await db.getAllAsync<{ position: number; track_id: string }>(
+      'SELECT position, track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position', [playlistId]);
+    const target = rows.find(r => r.position === position);
+    if (!target) { await db.execAsync('COMMIT'); return false; }
+    const rest = rows.filter(r => r !== target).map(r => r.track_id);
+    await db.runAsync('DELETE FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+    for (let i = 0; i < rest.length; i++) {
+      await db.runAsync('INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES (?,?,?)', [playlistId, i, rest[i]]);
+    }
+    await deleteOrphans(db, [target.track_id]);
+    await db.execAsync('COMMIT');
+    return true;
+  } catch (error) {
+    await db.execAsync('ROLLBACK');
+    throw error;
+  }
 }
 
 export interface PlaylistEntry { position: number; track: Track; status: MatchStatus | null; videoId: string | null }

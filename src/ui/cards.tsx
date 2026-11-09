@@ -27,13 +27,13 @@ export function PlaylistCard({ info, width, onPress, onDelete }: {
   );
 }
 
-/** Fila de canción con el vídeo elegido debajo. */
-export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress, onSearch }: {
+/** Fila de canción con el vídeo elegido debajo. Pulsación larga = acciones (p. ej. quitar). */
+export function TrackRow({ index, title, artists, videoCaption, status, isNow, playable, onPress, onSearch, onLongPress }: {
   index: number; title: string; artists: string; videoCaption?: string; status: string | null;
-  isNow: boolean; playable: boolean; onPress: () => void; onSearch?: () => void;
+  isNow: boolean; playable: boolean; onPress: () => void; onSearch?: () => void; onLongPress?: () => void;
 }) {
   return (
-    <Pressable onPress={onPress} disabled={!playable} style={s.row}>
+    <Pressable onPress={playable ? onPress : undefined} onLongPress={onLongPress} delayLongPress={450} style={s.row}>
       <View style={[s.num, isNow && { backgroundColor: colors.accent }]}>
         {isNow
           ? <Icon name="musical-notes" size={16} color={colors.onAccent} />

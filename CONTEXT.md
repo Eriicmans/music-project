@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **reproductor estilo Spotify (paso 12)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 13 (mejoras de biblioteca y copia de seguridad)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -118,7 +118,7 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - `src/core/search/searchSongs.ts` (`searchSongs`: filtro Canciones, reintento sin filtro, dedupe, máx. 20).
 - `repository.ts`: `createPlaylist(db, name)` (playlist propia sin Spotify), `addYoutubeTrackToPlaylist(db, playlistId, input)` (transacción; añade al final; no repite en la misma playlist; deja coincidencia `manual` + candidato para que se vea y reproduzca) y `YoutubeTrackInput`.
 - UI: `src/ui/SearchScreen.tsx` (nueva pestaña con lupa en `TabBar`, orden Biblioteca / Buscar / Revisar; tocar resultado = reproducir en el PlayerDock; botón + = añadir), `src/ui/AddToPlaylistSheet.tsx` (lista de playlists + "Nueva playlist"). `App.tsx`: `playSearchResult` (cola de 1 canción), `nowVideoId`.
-- **Limitación conocida:** reimportar una playlist de Spotify (`savePlaylist`) reescribe sus canciones y borraría las añadidas a mano a esa misma playlist. Pendiente decidir: proteger o fusionar.
+- (Resuelto en el paso 13) Reimportar una playlist de Spotify ya conserva las canciones añadidas a mano.
 - Pendiente posible: quitar canciones de una playlist, reordenar, resultados de "Vídeos", historial de búsquedas.
 
 ## Paso 12 — Reproductor estilo Spotify (hecho; tests del núcleo OK; UI NO ejecutada ni tipada en sandbox)
@@ -131,10 +131,20 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - **Fallo reportado (v3): al expandir el mini-reproductor se para y no responde.** Causa: `NowPlaying` era un `<Modal presentationStyle="fullScreen">`; iOS retira la vista de debajo de la ventana y el WebView del reproductor se pausa/queda inutilizable. Corrección: `NowPlaying` es ahora una capa `Animated.View` absoluta (zIndex 100) dentro de la app, hermana del `SafeAreaView` en `App.tsx` (raíz: `SafeAreaProvider > View flex:1 > [SafeAreaView, NowPlaying]`), con animación de subida, botón atrás de Android y arrastre hacia abajo desde la cabecera para cerrar. **Regla:** nada que cubra el reproductor puede ser un Modal a pantalla completa. (Los Modal `pageSheet` de ManualSearch/AddToPlaylistSheet dejan la vista de debajo en la jerarquía; pendiente comprobar que no pausan la música.)
 - Sin gradiente de fondo (haría falta `expo-linear-gradient`); fondo marrón sólido.
 
+## Paso 13 — Mejoras de biblioteca + copia de seguridad (hecho; 90 tests OK en sandbox con simulador de vitest; tipos comprobados con stubs; UI NO ejecutada en dispositivo)
+- **Git:** se trabaja en una rama (p. ej. `mejoras`); `main` queda intacta por si algo sale mal.
+- `repository.ts`: `savePlaylist` al reimportar **conserva las canciones añadidas a mano** (sin spotify_id, al final) y borra las que desaparecen de Spotify si no están en otra playlist; nuevas `renamePlaylist` y `removeTrackFromPlaylist(db, playlistId, position)` (recompone posiciones; borra la canción si queda huérfana).
+- `src/db/backup.ts`: `exportLibrary` (playlists, canciones y vídeos elegidos auto/manual; sin candidatos dudosos), `parseBackup(text)` (valida y da mensajes claros), `importLibrary` (**solo fusiona**: omite playlists de Spotify ya existentes y propias con el mismo nombre; reutiliza canciones por id de Spotify/YouTube; no pisa coincidencias existentes).
+- `src/ui/BackupPanel.tsx` (sin dependencias nuevas): Exportar = hoja de compartir del sistema con el JSON; Restaurar = pegar el texto. Está en la home (Biblioteca).
+- `App.tsx`: pulsación larga en una canción = quitarla de la playlist; tocar el nombre de la playlist (solo iOS, `Alert.prompt`) = renombrar (reimportar desde Spotify devuelve el nombre original); pista de ayuda bajo los filtros. `cards.tsx`: `TrackRow` con `onLongPress` (una fila sin vídeo ya no reproduce al tocarla).
+- Borrado `src/ui/PlayerDock.tsx` (sin uso).
+- Tests nuevos: `tests/library.test.ts`.
+- **Pendiente de verificar en el iPhone:** pulsación larga, renombrar, Exportar (hoja de compartir) y Restaurar pegando el texto.
+
 ## Siguiente sesión (orden recomendado)
 - **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).
 - Verificado por el usuario: paso 8 (biblioteca) funciona.
-- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) ✅ HECHO en paso 10 (búsqueda manual); (c) exportar/importar copia de `music.db`; (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
+- Candidatos (pendiente de elegir): (a) funciones de reproductor: aleatorio, repetir, mostrar progreso; (b) ✅ HECHO en paso 10 (búsqueda manual); (c) ✅ HECHO en paso 13 (copia en JSON); (d) >100 canciones vía OAuth de Spotify (Developer Mode exige Premium: confirmar si lo tiene); (e) pulir UI y nombre de la app.
 - Nota Windows: ejecutar `npx tsc --noEmit` y `npx vitest run` DENTRO de `...\MusicProject\music-project`.
 
 ## Pendiente de preguntar / decidir

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
 import { SearchFn } from './src/core/matching/matchTrack';
@@ -10,10 +10,12 @@ import { makeQueueDeps } from './src/db/matchingAdapter';
 import { openDb } from './src/db/openDb';
 import {
   ChosenVideo, countByStatus, deletePlaylist, getChosenVideos, getPlaylistEntries, listPlaylists, PlaylistEntry, PlaylistInfo,
+  removeTrackFromPlaylist, renamePlaylist,
 } from './src/db/repository';
 import { ImportError } from './src/importers/errors';
 import { importSpotifyPlaylist } from './src/importers/spotify/importPlaylist';
 import { searchYtMusic, YtResult } from './src/providers/youtubeMusic/search';
+import { BackupPanel } from './src/ui/BackupPanel';
 import { PlaylistCard, TrackRow } from './src/ui/cards';
 import { Btn, Chip, Disc, Icon, IconBtn } from './src/ui/kit';
 import { ManualSearch } from './src/ui/ManualSearch';
@@ -135,6 +137,40 @@ export default function App() {
         },
       },
     ]);
+
+  /** Pulsación larga en una canción: quitarla de la playlist (no afecta a Spotify). */
+  const askRemove = (e: PlaylistEntry) => {
+    if (!db || !current) return;
+    Alert.alert('Quitar canción', `¿Quitar "${e.track.title}" de "${current.name}"?`, [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Quitar', style: 'destructive',
+        onPress: async () => {
+          await removeTrackFromPlaylist(db, current.playlistId, e.position);
+          await refresh(db, current.playlistId);
+          setPlaylists(await listPlaylists(db));
+        },
+      },
+    ]);
+  };
+
+  /** Renombrar (Alert.prompt solo existe en iOS). Si reimportas desde Spotify, el nombre vuelve al original. */
+  const askRename = () => {
+    if (!db || !current || Platform.OS !== 'ios') return;
+    Alert.prompt('Renombrar playlist', undefined, [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Guardar',
+        onPress: async (value?: string) => {
+          const name = value?.trim();
+          if (!name) return;
+          await renamePlaylist(db, current.playlistId, name);
+          setCurrent({ playlistId: current.playlistId, name });
+          setPlaylists(await listPlaylists(db));
+        },
+      },
+    ], 'plain-text', current.name);
+  };
 
   /* ---------- Matching ---------- */
   const onMatch = async () => {
@@ -313,6 +349,13 @@ export default function App() {
         ))}
       </View>
 
+      {db && (
+        <BackupPanel
+          db={db}
+          onRestored={async () => { setPlaylists(await listPlaylists(db)); setCounts(await countByStatus(db)); }}
+        />
+      )}
+
       <Btn tone="soft" label="Diagnóstico de YouTube Music" onPress={onDebug} />
       {debugOut && <Text style={s.mono}>{debugOut}</Text>}
       {engineLog.length > 0 && <Text style={s.mono}>{'Reproductor:\n' + engineLog.join('\n')}</Text>}
@@ -331,7 +374,10 @@ export default function App() {
 
       <View style={s.nameRow}>
         <View style={{ flex: 1, gap: 4 }}>
-          <Text style={s.detailName} numberOfLines={2}>{current.name}</Text>
+          <Pressable onPress={askRename} disabled={Platform.OS !== 'ios'} style={s.nameTap}>
+            <Text style={[s.detailName, { flexShrink: 1 }]} numberOfLines={2}>{current.name}</Text>
+            {Platform.OS === 'ios' && <Icon name="create-outline" size={16} color={colors.faint} />}
+          </Pressable>
           <Text style={type.small}>{entries.length} canciones · {pending} dudosas · {none} sin resultado</Text>
         </View>
         <View style={{ alignItems: 'flex-end' }}>
@@ -363,6 +409,8 @@ export default function App() {
 
       {notices}
 
+      {entries.length > 0 && <Text style={type.small}>Mantén pulsada una canción para quitarla de la playlist.</Text>}
+
       <View style={{ gap: 8 }}>
         {visibleEntries.length === 0 && <Text style={type.body}>No hay canciones en este filtro.</Text>}
         {visibleEntries.map(e => {
@@ -372,7 +420,7 @@ export default function App() {
               key={e.position} index={e.position + 1} title={e.track.title} artists={e.track.artists.join(', ')}
               videoCaption={v ? `↳ ${v.title} — ${v.artists.join(', ')}` : undefined}
               status={e.status} isNow={e.track.id === nowTrackId} playable={!!v}
-              onPress={() => startAt(e.track.id)} onSearch={() => setManualFor(e.track)}
+              onPress={() => startAt(e.track.id)} onSearch={() => setManualFor(e.track)} onLongPress={() => askRemove(e)}
             />
           );
         })}
@@ -490,6 +538,7 @@ const s = StyleSheet.create({
   detailBarTitle: { color: colors.text, fontSize: 16, fontWeight: '700' },
   stage: { backgroundColor: colors.chip, borderRadius: radius.xl, height: 210, alignItems: 'center', justifyContent: 'center' },
   nameRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  nameTap: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   detailName: { color: colors.text, fontSize: 24, lineHeight: 28, fontWeight: '800', letterSpacing: -0.6 },
   big: { color: colors.text, fontSize: 26, fontWeight: '800', letterSpacing: -0.6 },
   bigMuted: { color: colors.faint, fontSize: 16, fontWeight: '700' },
