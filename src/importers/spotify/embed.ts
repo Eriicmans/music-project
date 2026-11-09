@@ -13,6 +13,8 @@ export interface EmbedPlaylist {
   partial: boolean;
   /** Pistas omitidas (archivos locales, episodios, entradas sin id). */
   skipped: number;
+  /** Token anónimo de corta duración que la página embed incluye para el reproductor web. */
+  accessToken?: string;
 }
 
 export const EMBED_TRACK_CAP = 100;
@@ -39,6 +41,14 @@ function findKey(node: unknown, key: string, depth = 0): unknown {
 export function artistsFromSubtitle(subtitle: unknown): string[] {
   if (typeof subtitle !== 'string') return [];
   return subtitle.replace(/\u00a0/g, ' ').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/** Token anónimo del embed (props.pageProps.state.settings.session.accessToken; si se mueve, se busca por el árbol). */
+export function extractAccessToken(data: unknown): string | undefined {
+  const session = findKey(data, 'session') as Record<string, unknown> | undefined;
+  const direct = session && typeof session === 'object' ? session.accessToken : undefined;
+  const token = typeof direct === 'string' ? direct : findKey(data, 'accessToken');
+  return typeof token === 'string' && token.length > 10 ? token : undefined;
 }
 
 export function parseEmbedHtml(html: string): EmbedPlaylist {
@@ -70,10 +80,14 @@ export function parseEmbedHtml(html: string): EmbedPlaylist {
     tracks,
     partial: list.length >= EMBED_TRACK_CAP,
     skipped,
+    accessToken: extractAccessToken(data),
   };
 }
 
-export type FetchFn = (url: string, init?: { headers?: Record<string, string> }) =>
+export type FetchFn = (
+  url: string,
+  init?: { headers?: Record<string, string>; method?: string; body?: string; signal?: unknown },
+) =>
   Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
 const HEADERS = {

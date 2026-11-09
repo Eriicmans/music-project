@@ -73,6 +73,9 @@ export default function App() {
   const [manualFor, setManualFor] = useState<Track | null>(null);
   const [debugOut, setDebugOut] = useState<string | null>(null);
   const signal = useRef({ aborted: false });
+  const matchingRef = useRef(false);
+  const currentIdRef = useRef<string | null>(null);
+  useEffect(() => { currentIdRef.current = current?.playlistId ?? null; }, [current]);
 
   /** Recarga la lista de playlists y las miniaturas de sus portadas. */
   const loadLibrary = useCallback(async (d: Db) => {
@@ -86,10 +89,12 @@ export default function App() {
       .catch(e => setError(`Error de base de datos: ${String(e)}`));
   }, []);
 
-  const refresh = useCallback(async (d: Db, playlistId: string) => {
-    setEntries(await getPlaylistEntries(d, playlistId));
+  const refresh = useCallback(async (d: Db, playlistId: string): Promise<PlaylistEntry[]> => {
+    const list = await getPlaylistEntries(d, playlistId);
+    setEntries(list);
     setChosen(await getChosenVideos(d, playlistId));
     setCounts(await countByStatus(d));
+    return list;
   }, []);
 
   const goTab = async (t: Tab) => {
@@ -105,29 +110,35 @@ export default function App() {
   const onImport = async () => {
     if (!db || busy) return;
     setBusy(true); setError(null); setMessage(null);
+    let imported: { playlistId: string; tracks: Track[]; text: string } | null = null;
     try {
       const sum = await importSpotifyPlaylist(db, url);
       setCurrent({ playlistId: sum.playlistId, name: sum.name });
       setTrackFilter('all'); setShowImport(false); setUrl('');
       await loadLibrary(db);
-      await refresh(db, sum.playlistId);
-      setMessage(
+      const list = await refresh(db, sum.playlistId);
+      const text =
         `${sum.total} canciones importadas (${sum.newTracks} nuevas).` +
         (sum.skipped ? ` ${sum.skipped} omitidas (locales/episodios).` : '') +
-        (sum.partial ? ' Spotify solo expone las primeras 100; puede haber más en la playlist.' : ''),
-      );
+        (sum.partial ? ' Spotify solo expone las primeras 100; puede haber más en la playlist.' : '');
+      setMessage(text);
+      imported = { playlistId: sum.playlistId, tracks: list.map(e => e.track), text };
     } catch (e) {
       setError(e instanceof ImportError ? e.message : `Error inesperado: ${String(e)}`);
     } finally {
       setBusy(false);
     }
+    // Al importar se buscan solas las coincidencias de YouTube Music.
+    if (imported) await runMatch(imported.playlistId, imported.tracks, imported.text);
   };
 
   /* ---------- Biblioteca ---------- */
   const openPlaylist = async (p: PlaylistInfo) => {
     if (!db) return;
     setCurrent({ playlistId: p.id, name: p.name }); setTrackFilter('all'); setMessage(null); setError(null);
-    await refresh(db, p.id);
+    const list = await refresh(db, p.id);
+    // Si quedaron canciones sin buscar (importación cancelada o cortada por errores), se retoma sola.
+    if (!matchingRef.current && list.some(e => e.status === null)) await runMatch(p.id, list.map(e => e.track));
   };
   const closePlaylist = async () => {
     setCurrent(null); setMessage(null); setError(null);
@@ -181,27 +192,32 @@ export default function App() {
     ], 'plain-text', current.name);
   };
 
-  /* ---------- Matching ---------- */
-  const onMatch = async () => {
-    if (!db || !current || matching) return;
-    setMatching(true); setError(null); setMessage(null);
+  /* ---------- Matching (automático al importar o al abrir una playlist con canciones sin buscar) ---------- */
+  const runMatch = async (playlistId: string, tracks: Track[], prefix = '') => {
+    if (!db || matchingRef.current || tracks.length === 0) return;
+    matchingRef.current = true;
+    setMatching(true); setError(null);
     signal.current = { aborted: false };
     try {
       const sum: QueueSummary = await runMatching(
-        entries.map(e => e.track),
+        tracks,
         makeQueueDeps(db, search),
         { signal: signal.current, onProgress: p => setProgress({ done: p.done, total: p.total, title: p.track.title }) },
       );
-      await refresh(db, current.playlistId);
+      if (currentIdRef.current === playlistId) await refresh(db, playlistId);
+      else setCounts(await countByStatus(db));
+      await loadLibrary(db);
       const parts = [
         `${sum.auto} automáticas`, `${sum.review} a revisar`, `${sum.none} sin resultado`,
         sum.skipped ? `${sum.skipped} ya resueltas` : '', sum.errors ? `${sum.errors} errores` : '',
       ].filter(Boolean);
-      setMessage(`${sum.aborted ? 'Cancelado. ' : ''}Matching: ${parts.join(' · ')}.`);
-      if (sum.stoppedByErrors) setError('Se detuvo por errores seguidos (¿sin conexión o YouTube bloqueando?).');
+      const line = `${sum.aborted ? 'Búsqueda cancelada. ' : ''}Coincidencias: ${parts.join(' · ')}.`;
+      setMessage(prefix ? `${prefix} ${line}` : line);
+      if (sum.stoppedByErrors) setError('Se detuvo por errores seguidos (¿sin conexión o YouTube bloqueando?). Vuelve a abrir la playlist para retomar.');
     } catch (e) {
       setError(`Error inesperado: ${String(e)}`);
     } finally {
+      matchingRef.current = false;
       setMatching(false); setProgress(null);
     }
   };
@@ -426,12 +442,9 @@ export default function App() {
           <View style={s.bar}><View style={[s.barFill, { width: `${progress ? Math.round((progress.done / progress.total) * 100) : 0}%` }]} /></View>
           <Btn tone="soft" label="Cancelar" onPress={() => { signal.current.aborted = true; }} />
         </View>
-      ) : (
-        <View style={s.row}>
-          <Btn flex tone="soft" icon="search" label="Buscar coincidencias" onPress={onMatch} disabled={busy} />
-          {pending > 0 && <Btn flex tone="soft" icon="checkmark-done" label={`Revisar (${pending})`} onPress={() => goTab('review')} />}
-        </View>
-      )}
+      ) : pending > 0 ? (
+        <Btn tone="soft" icon="checkmark-done" label={`Revisar (${pending})`} onPress={() => goTab('review')} />
+      ) : null}
 
       {notices}
 
