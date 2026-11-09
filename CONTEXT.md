@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 3** (SQLite). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **paso 4** (importador Spotify). El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -45,6 +45,13 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
   - `tests/db.test.ts` + `tests/helpers/nodeSqliteDb.ts` (adaptador sobre `node:sqlite`, requiere Node ≥22.13; emite un ExperimentalWarning inocuo). Requiere `npm i -D @types/node` (TS 6 ya no carga @types automáticamente; el helper usa `/// <reference types="node" />`).
   - `App.tsx` de verificación: abre la BD y muestra "Base de datos lista · esquema v1" y contadores. Sin UI real todavía.
 
+## Paso 4 — Importador de Spotify (hecho; 39 tests, tsc OK; NO verificado contra Spotify real)
+- **Investigación (nov 2026):** desde feb 2026 la Web API oficial de Spotify en Developer Mode solo devuelve los items de playlists cuyo dueño/colaborador es el usuario; Client Credentials ya no sirve para playlists; Developer Mode exige Premium y pocos usuarios. Pegar un enlace público ajeno NO es posible por la vía oficial. Playlists propias vía OAuth PKCE sí darían lista completa con ISRC (opción futura).
+- **Vía elegida (no oficial, uso personal):** página embed pública `https://open.spotify.com/embed/playlist/{id}` → JSON en `<script id="__NEXT_DATA__">` → `entity.trackList` (uri, title, subtitle=artistas separados por coma/nbsp, duration en ms). Limitaciones: **máx. ~100 canciones**, **sin ISRC ni álbum**, no documentada (puede romperse). No se implementó la paginación vía GraphQL interno (`pathfinder`) porque no se pudo verificar el hash de la consulta persistida y fuentes se contradicen sobre si sigue funcionando. Para listas >100: copiar la playlist a una propia/dividirla, u OAuth PKCE más adelante.
+- Código: `src/importers/errors.ts` (`ImportError` con códigos invalid_url|not_playlist|short_link|network|unavailable|parse), `src/importers/spotify/parseUrl.ts` (`parsePlaylistId`: enlaces open/play/embed, intl-xx, user/x/playlist, URI, id suelto; rechaza álbum/pista/spotify.link), `embed.ts` (`parseEmbedHtml`, `fetchEmbedPlaylist`, tolerante a cambios con búsqueda recursiva de `trackList`; omite locales/episodios; `partial` si ≥100), `importPlaylist.ts` (`importSpotifyPlaylist(db, url, fetchFn=fetch)` → `{playlistId,name,total,newTracks,skipped,partial}`; versión de la canción vía `parseTitle`; transacción; reimportar no duplica).
+- `App.tsx` ahora tiene pantalla V0.4: caja de enlace + botón Importar + resumen + primeras 15 canciones. Usa `react-native-safe-area-context` (instalar con `npx expo install react-native-safe-area-context`; elimina el warning de SafeAreaView deprecado).
+- **Pendiente:** el usuario debe probar con una playlist real de Spotify en el iPhone; si falla ("parse"/"unavailable") pedirle el mensaje y, si puede, el HTML/JSON de la página embed para ajustar el parser.
+
 ## Limitaciones conocidas del matching
 - `splitArtists` divide por `&`, `and`, `x`, `y`, `,`: nombres como "Earth, Wind & Fire" generan partes sueltas (puede dar coincidencias parciales falsas; lo compensa que el principal debe coincidir para `auto`).
 - Descripciones de YouTube/canales "Topic" aún no se usan como señal.
@@ -53,8 +60,8 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 1. ✅ Matching base corregido + tests.
 2. ✅ Parseo de títulos, versiones, feat., similitud.
 3. ✅ Persistencia SQLite.
-4. ⏭ Importador de Spotify (verificar en docs actuales qué permite la API con playlists públicas; tokens en SecureStore).
-5. Búsqueda de candidatos en YouTube (decidir librería/endpoint no oficial) + scoring + cola de revisión.
+4. ✅ Importador de Spotify (vía embed público; ver sección 'Paso 4').
+5. ⏭ Búsqueda de candidatos en YouTube (decidir librería/endpoint no oficial) + scoring + cola de revisión.
 6. Pantalla de revisión de coincidencias (2-3 mejores candidatos por canción dudosa).
 7. Reproductor.
 
