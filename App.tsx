@@ -4,7 +4,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { runMatching, QueueSummary } from './src/core/matching/matchQueue';
 import { SearchFn } from './src/core/matching/matchTrack';
 import { Track } from './src/models/Track';
-import { buildQueue, QueueItem, shuffleQueue, stepIndex } from './src/core/player/queue';
+import { buildQueue, nextIndex, nextRepeat, QueueItem, RepeatMode, shuffleQueue } from './src/core/player/queue';
 import { Db } from './src/db/database';
 import { makeQueueDeps } from './src/db/matchingAdapter';
 import { openDb } from './src/db/openDb';
@@ -18,7 +18,10 @@ import { PlaylistCard, TrackRow } from './src/ui/cards';
 import { Btn, Chip, Disc, Icon, IconBtn } from './src/ui/kit';
 import { ManualSearch } from './src/ui/ManualSearch';
 import { SearchScreen } from './src/ui/SearchScreen';
-import { PlayerDock } from './src/ui/PlayerDock';
+import { MiniPlayer } from './src/ui/MiniPlayer';
+import { NowPlaying } from './src/ui/NowPlaying';
+import { usePlayerProgress } from './src/ui/usePlayerProgress';
+import { PlayerHandle, YouTubePlayer } from './src/ui/YouTubePlayer';
 import { ReviewScreen } from './src/ui/ReviewScreen';
 import { Tab, TabBar } from './src/ui/TabBar';
 import { colors, fonts, radius, type } from './src/ui/theme';
@@ -54,6 +57,10 @@ export default function App() {
   const [nowIdx, setNowIdx] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [shuffle, setShuffle] = useState(false);
+  const [repeat, setRepeat] = useState<RepeatMode>('off');
+  const [expanded, setExpanded] = useState(false);
+  const [source, setSource] = useState('Playlist');
+  const engine = useRef<PlayerHandle>(null);
   const [manualFor, setManualFor] = useState<Track | null>(null);
   const [debugOut, setDebugOut] = useState<string | null>(null);
   const signal = useRef({ aborted: false });
@@ -165,16 +172,30 @@ export default function App() {
     const b = buildQueue(entries);
     if (b.length === 0) return;
     const shuf = forceShuffle ?? shuffle;
+    setSource(current?.name ?? 'Playlist');
     setShuffle(shuf); setBase(b);
     if (shuf) { setQueue(shuffleQueue(b, trackId)); setNowIdx(0); }
     else { setQueue(b); setNowIdx(trackId ? Math.max(0, b.findIndex(i => i.trackId === trackId)) : 0); }
     setPlaying(true);
   };
+  const restart = () => {
+    engine.current?.seekTo(0);
+    setPlaying(false);
+    setTimeout(() => setPlaying(true), 60);
+  };
   const step = (dir: 1 | -1) => {
     if (nowIdx === null) return;
-    const n = stepIndex(nowIdx, queue.length, dir);
-    if (n === null) { if (dir === 1) { setNowIdx(null); setPlaying(false); } return; }
+    const n = nextIndex(nowIdx, queue.length, dir, repeat);
+    if (n === null) { if (dir === 1) { setNowIdx(null); setPlaying(false); setExpanded(false); } return; }
+    if (n === nowIdx) { restart(); return; }
     setNowIdx(n); setPlaying(true);
+  };
+  const onEnded = () => { if (repeat === 'one') restart(); else step(1); };
+  /** Como en las apps de streaming: pasados 3 s, "anterior" vuelve al inicio de la canción. */
+  const onPrev = async () => {
+    const t = await engine.current?.getCurrentTime().catch(() => 0);
+    if ((t ?? 0) > 3) { engine.current?.seekTo(0); return; }
+    step(-1);
   };
   const toggleShuffle = () => {
     if (nowIdx === null) { setShuffle(v => !v); return; }
@@ -185,7 +206,7 @@ export default function App() {
   };
   const playSearchResult = (r: YtResult) => {
     const item: QueueItem = { trackId: `yt:${r.videoId}`, videoId: r.videoId, title: r.title, artists: r.artists };
-    setShuffle(false); setBase([item]); setQueue([item]); setNowIdx(0); setPlaying(true);
+    setSource('Búsqueda'); setShuffle(false); setBase([item]); setQueue([item]); setNowIdx(0); setPlaying(true);
   };
   const onPlayerError = () => {
     const cur = nowIdx !== null ? queue[nowIdx] : null;
@@ -359,12 +380,24 @@ export default function App() {
         )}
 
         {nowIdx !== null && queue[nowIdx] && (
-          <PlayerDock
-            item={queue[nowIdx]} playing={playing} shuffle={shuffle}
-            onToggle={() => setPlaying(p => !p)} onNext={() => step(1)} onPrev={() => step(-1)}
-            onClose={() => { setNowIdx(null); setPlaying(false); }}
-            onToggleShuffle={toggleShuffle} onEnded={() => step(1)} onError={onPlayerError} onPlayingChange={setPlaying}
-          />
+          <>
+            <YouTubePlayer
+              ref={engine} videoId={queue[nowIdx].videoId} playing={playing}
+              onEnded={onEnded} onError={onPlayerError} onPlayingChange={setPlaying}
+            />
+            <MiniPlayerWithProgress
+              item={queue[nowIdx]} playing={playing} engine={engine}
+              onOpen={() => setExpanded(true)} onToggle={() => setPlaying(p => !p)} onNext={() => step(1)}
+            />
+            {expanded && (
+              <NowPlaying
+                item={queue[nowIdx]} source={source} playing={playing} shuffle={shuffle} repeat={repeat} engine={engine}
+                onClose={() => setExpanded(false)} onToggle={() => setPlaying(p => !p)}
+                onNext={() => step(1)} onPrev={onPrev}
+                onToggleShuffle={toggleShuffle} onCycleRepeat={() => setRepeat(nextRepeat)}
+              />
+            )}
+          </>
         )}
 
         {manualFor && db && current && (
@@ -384,6 +417,20 @@ export default function App() {
         <TabBar tab={tab} onChange={goTab} pending={counts.pending ?? 0} />
       </SafeAreaView>
     </SafeAreaProvider>
+  );
+}
+
+/** Mini-reproductor con su propio sondeo de progreso (así App no se redibuja cada 0,5 s). */
+function MiniPlayerWithProgress({ item, playing, engine, onOpen, onToggle, onNext }: {
+  item: QueueItem; playing: boolean; engine: React.RefObject<PlayerHandle | null>;
+  onOpen: () => void; onToggle: () => void; onNext: () => void;
+}) {
+  const { position, duration } = usePlayerProgress(engine, playing, item.videoId);
+  return (
+    <MiniPlayer
+      item={item} playing={playing} progress={duration > 0 ? position / duration : 0}
+      onOpen={onOpen} onToggle={onToggle} onNext={onNext}
+    />
   );
 }
 

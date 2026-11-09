@@ -33,3 +33,41 @@ describe('aleatorio', () => {
     expect(shuffleQueue(items, undefined, () => 0).map(i => i.trackId)).not.toEqual(['1', '2', '3', '4', '5']);
   });
 });
+
+import { nextIndex, nextRepeat } from '../src/core/player/queue';
+import { clamp01, formatClock, thumbnailUrl } from '../src/core/player/format';
+
+describe('repetir', () => {
+  it('cicla off → all → one → off', () => {
+    expect(nextRepeat('off')).toBe('all');
+    expect(nextRepeat('all')).toBe('one');
+    expect(nextRepeat('one')).toBe('off');
+  });
+  it('sin repetir (o con repetir una) los extremos devuelven null', () => {
+    for (const m of ['off', 'one'] as const) {
+      expect(nextIndex(2, 3, 1, m)).toBeNull();
+      expect(nextIndex(0, 3, -1, m)).toBeNull();
+      expect(nextIndex(0, 3, 1, m)).toBe(1);
+    }
+  });
+  it('repetir todo da la vuelta en ambos sentidos', () => {
+    expect(nextIndex(2, 3, 1, 'all')).toBe(0);
+    expect(nextIndex(0, 3, -1, 'all')).toBe(2);
+    expect(nextIndex(0, 1, 1, 'all')).toBe(0);
+    expect(nextIndex(0, 0, 1, 'all')).toBeNull();
+  });
+});
+
+describe('formato del reproductor', () => {
+  it('formatClock', () => {
+    expect(formatClock(83.9)).toBe('1:23');
+    expect(formatClock(5)).toBe('0:05');
+    expect(formatClock(3600)).toBe('60:00');
+    expect(formatClock(-3)).toBe('0:00');
+    expect(formatClock(NaN)).toBe('0:00');
+  });
+  it('clamp01 y thumbnailUrl', () => {
+    expect(clamp01(-1)).toBe(0); expect(clamp01(2)).toBe(1); expect(clamp01(0.4)).toBe(0.4); expect(clamp01(NaN)).toBe(0);
+    expect(thumbnailUrl('abc')).toBe('https://i.ytimg.com/vi/abc/hqdefault.jpg');
+  });
+});

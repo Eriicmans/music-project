@@ -24,6 +24,20 @@ export function stepIndex(index: number, length: number, dir: 1 | -1): number | 
   return n >= 0 && n < length ? n : null;
 }
 
+export type RepeatMode = 'off' | 'all' | 'one';
+
+export const nextRepeat = (m: RepeatMode): RepeatMode => (m === 'off' ? 'all' : m === 'all' ? 'one' : 'off');
+
+/**
+ * Índice siguiente/anterior según el modo de repetir. Con 'all' la cola da la vuelta;
+ * con 'off' y 'one' (al pasar a mano) se sale por los extremos (null).
+ */
+export function nextIndex(index: number, length: number, dir: 1 | -1, repeat: RepeatMode): number | null {
+  const n = stepIndex(index, length, dir);
+  if (n !== null || repeat !== 'all' || length === 0) return n;
+  return dir === 1 ? 0 : length - 1;
+}
+
 /**
  * Mezcla la cola (Fisher-Yates). Si se indica `firstTrackId`, esa canción queda
  * la primera y el resto se mezcla. `random` es inyectable para los tests.

@@ -1,6 +1,6 @@
 # CONTEXT.md — Music Project (clon personal de Demus, mejorado)
 
-> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras la **pestaña Buscar y añadir a playlist (paso 11)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
+> **REGLA DE ENTREGA (obligatoria): devuelve SIEMPRE archivos completos (create_file + present_files) con su ruta exacta, listos para sustituir. NUNCA fragmentos para pegar. Respuestas muy cortas, sin gastar tokens.** Pega este archivo al inicio de un prompt nuevo para retomar el trabajo. Última actualización: tras el **reproductor estilo Spotify (paso 12)**. El usuario ya tiene el proyecto Expo funcionando en su PC; se le entregan solo archivos sueltos con ruta.
 
 ## Objetivo
 App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía YouTube e importa playlists de Spotify pegando el enlace (playlists públicas). **Mejora clave:** que la canción importada sea la correcta (Demus a veces importa una homónima de otro artista). Por eso el matching puntúa candidatos y manda a revisión manual lo dudoso.
@@ -120,6 +120,13 @@ App iOS **de uso personal** (no comercial), estilo Demus: reproduce música vía
 - UI: `src/ui/SearchScreen.tsx` (nueva pestaña con lupa en `TabBar`, orden Biblioteca / Buscar / Revisar; tocar resultado = reproducir en el PlayerDock; botón + = añadir), `src/ui/AddToPlaylistSheet.tsx` (lista de playlists + "Nueva playlist"). `App.tsx`: `playSearchResult` (cola de 1 canción), `nowVideoId`.
 - **Limitación conocida:** reimportar una playlist de Spotify (`savePlaylist`) reescribe sus canciones y borraría las añadidas a mano a esa misma playlist. Pendiente decidir: proteger o fusionar.
 - Pendiente posible: quitar canciones de una playlist, reordenar, resultados de "Vídeos", historial de búsquedas.
+
+## Paso 12 — Reproductor estilo Spotify (hecho; tests del núcleo OK; UI NO ejecutada ni tipada en sandbox)
+- Petición del usuario: no mostrar el vídeo al reproducir; interfaz como la del reproductor de Spotify (captura de referencia: cabecera "Reproduciendo desde", portada grande, título/artista, barra de progreso con tiempos, shuffle/anterior/play/siguiente/repetir) pero con nuestra paleta.
+- `YouTubePlayer.tsx` reescrito (`forwardRef`, `PlayerHandle`: getCurrentTime/getDuration/seekTo). El iframe va oculto en un contenedor de 1×1 px con overflow hidden (opacity 0.01) montado en App mientras haya canción. **Riesgo no verificado:** si iOS/Expo Go pausara el WebView así, hay que probar con un contenedor mayor o cambiar de motor.
+- Nuevos: `Cover.tsx` (miniatura `i.ytimg.com/vi/ID/hqdefault.jpg` recortada al cuadrado; fallback Disc), `Slider.tsx` (PanResponder), `usePlayerProgress.ts` (sondeo cada 500 ms), `MiniPlayer.tsx` (barra compacta con progreso; tocar abre pantalla completa), `NowPlaying.tsx` (Modal fullScreen), `core/player/format.ts` (`formatClock`, `thumbnailUrl`, `clamp01`). `queue.ts`: `RepeatMode`, `nextRepeat`, `nextIndex`. `kit.tsx`: IconBtn tone `light`.
+- `App.tsx`: estados `repeat`, `expanded`, `source`; "anterior" vuelve al inicio si han pasado >3 s; repetir uno/todo; `PlayerDock.tsx` ya no se usa (se puede borrar).
+- Sin gradiente de fondo (haría falta `expo-linear-gradient`); fondo marrón sólido.
 
 ## Siguiente sesión (orden recomendado)
 - **Decisión (9-nov-2026):** el usuario NO tiene cuenta Apple Developer, así que no puede instalar builds de EAS en su iPhone: la app seguirá en Expo Go. Reproducción en segundo plano queda APARCADA (el iframe se pausa al bloquear; una vía no oficial de audio seguramente tampoco sería fiable en Expo Go, sin verificar).

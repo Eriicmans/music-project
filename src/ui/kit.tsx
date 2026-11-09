@@ -11,9 +11,9 @@ export function Icon({ name, size = 20, color = colors.text }: { name: IconName;
 }
 
 /* ---------- Botón cuadrado redondeado con icono ---------- */
-type IconTone = 'soft' | 'accent' | 'dark' | 'ghost';
-const ICON_BG: Record<IconTone, string> = { soft: colors.chip, accent: colors.accent, dark: colors.dark, ghost: 'transparent' };
-const ICON_FG: Record<IconTone, string> = { soft: colors.text, accent: colors.onAccent, dark: colors.onDark, ghost: colors.text };
+type IconTone = 'soft' | 'accent' | 'dark' | 'ghost' | 'light';
+const ICON_BG: Record<IconTone, string> = { soft: colors.chip, accent: colors.accent, dark: colors.dark, ghost: 'transparent', light: 'transparent' };
+const ICON_FG: Record<IconTone, string> = { soft: colors.text, accent: colors.onAccent, dark: colors.onDark, ghost: colors.text, light: colors.onDark };
 
 export function IconBtn({ name, onPress, tone = 'soft', size = 46, iconSize = 20, badge, disabled }: {
   name: IconName; onPress: () => void; tone?: IconTone; size?: number; iconSize?: number; badge?: number; disabled?: boolean;
