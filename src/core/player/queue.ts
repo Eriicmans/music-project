@@ -23,3 +23,17 @@ export function stepIndex(index: number, length: number, dir: 1 | -1): number | 
   const n = index + dir;
   return n >= 0 && n < length ? n : null;
 }
+
+/**
+ * Mezcla la cola (Fisher-Yates). Si se indica `firstTrackId`, esa canción queda
+ * la primera y el resto se mezcla. `random` es inyectable para los tests.
+ */
+export function shuffleQueue(items: QueueItem[], firstTrackId?: string, random: () => number = Math.random): QueueItem[] {
+  const first = firstTrackId ? items.find(i => i.trackId === firstTrackId) : undefined;
+  const rest = items.filter(i => i !== first);
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [rest[i], rest[j]] = [rest[j], rest[i]];
+  }
+  return first ? [first, ...rest] : rest;
+}
