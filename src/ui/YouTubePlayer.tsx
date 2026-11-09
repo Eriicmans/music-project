@@ -1,4 +1,4 @@
-import React, { forwardRef, useImperativeHandle, useRef } from 'react';
+import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { View } from 'react-native';
 import YoutubePlayer, { YoutubeIframeRef } from 'react-native-youtube-iframe';
 
@@ -28,6 +28,7 @@ export interface PlayerHandle {
   seekTo: (seconds: number) => void;
 }
 
+const wait = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 const W = 240;
 const H = 135;
 
@@ -46,6 +47,34 @@ export const YouTubePlayer = forwardRef<PlayerHandle, PlayerProps>(function YouT
     seekTo: (seconds: number) => { inner.current?.seekTo(seconds, true); },
   }), []);
 
+  /**
+   * Pausa fiable: en iOS a veces el iframe ignora la orden de pausar (la canción sigue sonando).
+   * Tras pausar se comprueba que el tiempo no avanza; si avanza, se reenvía la orden
+   * (play→pause) hasta 3 veces. Mientras se reintenta se ignoran los estados del iframe.
+   */
+  const [force, setForce] = useState<boolean | null>(null);
+  const forcing = useRef(false);
+  useEffect(() => {
+    if (playing) return;
+    let cancelled = false;
+    (async () => {
+      await wait(500);
+      for (let attempt = 1; attempt <= 3 && !cancelled; attempt++) {
+        const a = (await inner.current?.getCurrentTime().catch(() => 0)) ?? 0;
+        await wait(600);
+        const b = (await inner.current?.getCurrentTime().catch(() => 0)) ?? 0;
+        if (cancelled || b - a < 0.3) break;
+        onLog?.(`la pausa no surtió efecto; reintento ${attempt}`);
+        forcing.current = true;
+        setForce(true); await wait(150);
+        setForce(false); await wait(700);
+      }
+      forcing.current = false;
+      if (!cancelled) setForce(null);
+    })();
+    return () => { cancelled = true; forcing.current = false; setForce(null); };
+  }, [playing, videoId, onLog]);
+
   return (
     <View
       pointerEvents={catchTap ? 'auto' : 'none'}
@@ -61,11 +90,12 @@ export const YouTubePlayer = forwardRef<PlayerHandle, PlayerProps>(function YouT
           width={W}
           height={H}
           videoId={videoId}
-          play={playing}
+          play={force ?? playing}
           webViewProps={{ allowsInlineMediaPlayback: true, mediaPlaybackRequiresUserAction: false }}
           onReady={() => onLog?.('listo')}
           onChangeState={(state: string) => {
             onLog?.(`estado: ${state}`);
+            if (forcing.current) return;
             if (state === 'ended') onEnded();
             else if (state === 'playing') onPlayingChange(true);
             else if (state === 'paused') onPlayingChange(false);
